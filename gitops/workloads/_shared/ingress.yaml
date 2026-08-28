@@ -1,0 +1,41 @@
+# # L7 routing, portable between local and AWS: only ingressClassName changes, every rule
+# # stays. The two controllers use different annotation prefixes and each ignores the other,
+# # so both sets can live in one file.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  annotations:
+    # --- AWS Load Balancer Controller (when switching to ingressClassName: alb) ---
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/success-codes: "200"
+    # --- ingress-nginx ---
+    nginx.ingress.kubernetes.io/proxy-body-size: 10m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+spec:
+  ingressClassName: nginx
+  rules:
+    # No host, so this is a catch-all rule. Needed because requests arrive with several
+    # different Host headers — ALB, CloudFront, Route53 — and all must serve the same app.
+    - http:
+        paths:
+          # --- REST API Gateway (Single Entrypoint for all metrics) ---
+          - path: /api/k8s-metrics
+            pathType: Prefix
+            backend:
+              service:
+                name: rest-service-svc
+                port:
+                  number: 4000
+          # --- Next.js Web Frontend Root ---
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-svc
+                port:
+                  name: http

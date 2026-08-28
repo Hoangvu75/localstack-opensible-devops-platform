@@ -1,0 +1,10 @@
+# Resources that belong to no single service.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# No `namespace:` here: namespace.yaml is cluster-scoped, so Kustomize would ignore it.
+# Instrumentation and Ingress declare their own namespace in metadata instead.
+resources:
+  - namespace.yaml
+  - instrumentation.yaml
+  - ingress.yaml

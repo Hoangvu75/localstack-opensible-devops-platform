@@ -1,0 +1,18 @@
+# --- OpenSible & LocalStack Local Data ---
+data/
+
+# --- Environment Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Terraform / OpenTofu Runtime Files ---
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# --- OS Junk Files ---
+.DS_Store
+Thumbs.db
+
+.tmp

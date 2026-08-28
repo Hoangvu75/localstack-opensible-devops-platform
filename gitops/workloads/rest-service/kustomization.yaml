@@ -1,0 +1,27 @@
+# Kustomization for rest-service alone. One environment, one directory — no base/overlay.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# REQUIRED: without it resources get no namespace and ClusterRoleBindings point at the wrong one.
+namespace: devops-apps
+
+resources:
+- deployment.yaml
+- service.yaml
+
+# includeSelectors is off: label only, never touch the Deployment selector (changing a
+# selector forces a delete and recreate).
+#
+labels:
+- pairs:
+    app.kubernetes.io/managed-by: argocd
+    app.kubernetes.io/name: rest-service
+    app.kubernetes.io/part-of: learn-opensible
+
+# ── Where CI hands over to CD ────────────────────────────────────────────────
+# CodeBuild runs `kustomize edit set image` in THIS directory and commits. One file per
+# service, so two parallel builds never clobber each other. See README §3.4.
+images:
+- name: learn-opensible-rest-service
+  newName: 000000000000.dkr.ecr.us-east-1.localhost.localstack.cloud:4566/learn-opensible-rest-service
+  newTag: d115a37

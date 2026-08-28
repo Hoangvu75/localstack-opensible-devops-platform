@@ -1,0 +1,9 @@
+# The telemetry pipeline, deliberately in its own directory rather than under signoz/:
+# it belongs to no backend. Swapping backends is one exporter, not a move of this folder.
+#
+# Wave 24, after the backend, so the logs are not full of "connection refused".
+name: otel-collector
+namespace: observability
+manifestPath: gitops/platform/otel-collector
+syncWave: "24"
+prune: "true"

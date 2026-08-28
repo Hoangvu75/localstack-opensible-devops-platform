@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Namespace `observability` now holds only the Collector. The name is kept rather than renamed
+# to `otel-collector`: playbook 3 creates it and existing queries filter on it.
+namespace: observability
+
+resources:
+  - otel-collector.yaml
+
+# configMapGenerator hashes the content into the ConfigMap name, so a config change renames it
+# and the DaemonSet rolls by itself. Replaces the sed-checksum hack the playbook used to do.
+configMapGenerator:
+  - name: otel-collector-config
+    files:
+      - config.yaml=otel-collector-config.yaml

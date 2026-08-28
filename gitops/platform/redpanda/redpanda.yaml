@@ -1,0 +1,123 @@
+# ==============================================================================
+# Redpanda — message queue speaking the Kafka wire protocol.
+#
+# Same protocol, so everything treats it as Kafka: kafkajs, aiokafka, kafka-clients, and —
+# the reason it is here — OpenTelemetry auto-instrumentation, which sees Kafka and emits
+# PRODUCER/CONSUMER spans with no code change at all.
+#
+# The difference is operational: one C++ binary, no JVM, no ZooKeeper. Kafka KRaft needs
+# about 1GB just to start on this cluster; Redpanda in dev mode runs in a few hundred MB.
+# On k3d over Docker Desktop that is the difference between working and not.
+#
+# ONE broker, replication factor 1, data in an emptyDir. Losing the pod loses the data, and
+# that is fine here because the payloads are metric snapshots worth nothing after a few
+# minutes. Production is the opposite: 3+ brokers, StatefulSet with PVCs, replication
+# factor 3, min.insync.replicas 2. Do not copy this file there.
+# ==============================================================================
+#
+#
+#
+#
+# ------------------------------------------------------------------------------
+#
+#
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  namespace: redpanda
+  labels:
+    app: redpanda
+spec:
+  selector:
+    app: redpanda
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: 9092
+    # Admin API — health checks and topic creation via rpk.
+    - name: admin
+      port: 9644
+      targetPort: 9644
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redpanda
+  namespace: redpanda
+  labels:
+    app: redpanda
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two brokers writing one emptyDir would corrupt it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redpanda
+  template:
+    metadata:
+      labels:
+        app: redpanda
+    spec:
+      # No inject-* annotation here. Redpanda is infrastructure, not one of our applications;
+      # its spans would be noise. What matters is the client-side PRODUCER/CONSUMER pair.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        fsGroup: 101
+      containers:
+        - name: redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:v26.2.2
+          args:
+            - redpanda
+            - start
+            # dev-container turns off production hardware checks (hugepages, IO tuning, disk latency).
+            # Without it Redpanda refuses to start here.
+            # Docker Desktop.
+            - --mode=dev-container
+            # One core. Redpanda otherwise claims every core it can see — 12 here — and builds 12 shards
+            # for a topic with almost no load.
+            - --smp=1
+            - --memory=512M
+            - --reserve-memory=0M
+            - --overprovisioned
+            - --default-log-level=warn
+            # advertise-kafka-addr MUST be the Service name, not localhost. A Kafka client connects once
+            # for metadata and then RECONNECTS to the address the broker advertises. Get it wrong and the
+            # client connects, then hangs — a hard failure to diagnose.
+            - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+            - --advertise-kafka-addr=PLAINTEXT://redpanda.redpanda.svc.cluster.local:9092
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: admin
+              containerPort: 9644
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          # The Admin API returns 200 once the broker accepts Kafka connections.
+          startupProbe:
+            httpGet: { path: /v1/status/ready, port: admin }
+            periodSeconds: 2
+            failureThreshold: 45
+          livenessProbe:
+            httpGet: { path: /v1/status/ready, port: admin }
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /v1/status/ready, port: admin }
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/redpanda/data
+      volumes:
+        # emptyDir, not a PVC — see the note at the top of this file.
+        - name: data
+          emptyDir: {}

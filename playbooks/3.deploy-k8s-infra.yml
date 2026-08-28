@@ -1,0 +1,313 @@
+---
+# Bootstrap GitOps — this playbook bootstraps ArgoCD and hands cluster management to GitOps.
+#
+# Primary steps:
+#   1. Install ArgoCD           → bootstrap paradox: ArgoCD cannot install itself
+#   2. Ingest Secrets           → secrets belong outside git (source of truth is Secrets Manager)
+#   3. Register ALB target      → AWS API interaction (register node IPs for LocalStack)
+#
+# Then applies ONE ApplicationSet. ingress-nginx, Redpanda, SigNoz, Collector,
+# and applications are automatically discovered and synced by ArgoCD from `gitops/`.
+- name: Bootstrap ArgoCD and hand the cluster over to GitOps
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    aws_endpoint: "{{ lookup('env', 'AWS_ENDPOINT') | default('http://localstack:4566', true) }}"
+    is_local: "{{ 'true' if 'localstack' in aws_endpoint or 'localhost' in aws_endpoint else 'false' }}"
+
+    aws_region: "{{ lookup('env', 'AWS_DEFAULT_REGION') | default('us-east-1', true) }}"
+    aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') | default('mock_access_key', true) }}"
+    aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') | default('mock_secret_key', true) }}"
+
+    github_repo: "github.com/Hoangvu75/learn-opensible.git"
+    git_branch: "main"
+
+    project_name: "learn-opensible"
+
+    # GitHub token retrieved from AWS Secrets Manager (populated by playbooks/1.manage-secrets.yml).
+    secret_id_github: "{{ project_name }}/github-token"
+
+    repo_dir: "/tmp/learn-opensible"
+    kubectl: "/usr/local/bin/kubectl"
+    kubeconfig: "/root/.kube/config"
+
+    argocd_namespace: "argocd"
+    argocd_manifest: "gitops/bootstrap/argocd/install-v2.13.2.yaml"
+    appset_manifest: "gitops/bootstrap/appset.yaml"
+
+  tasks:
+    - name: Ensure CLI tooling is present
+      ansible.builtin.shell: |
+        set -e
+        if ! command -v aws >/dev/null 2>&1; then
+          curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+          unzip -q -o /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install --update
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+          echo installed-aws
+        fi
+        if [ ! -x /usr/local/bin/kubectl ]; then
+          curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.28.2/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+          echo installed-kubectl
+        fi
+        aws --version
+        /usr/local/bin/kubectl version --client=true 2>/dev/null | head -1 || true
+      register: tooling
+      changed_when: "'installed' in tooling.stdout"
+
+    - name: Ensure fresh working directory
+      ansible.builtin.file:
+        path: "{{ repo_dir }}"
+        state: absent
+
+    # ── Retrieve git credential from AWS Secrets Manager ─────────────────────────
+    - name: Read the GitHub token from Secrets Manager
+      ansible.builtin.shell: |
+        if [ "{{ is_local }}" = "true" ]; then EP="--endpoint-url {{ aws_endpoint }}"; else EP=""; fi
+        aws secretsmanager get-secret-value --secret-id {{ secret_id_github }} \
+          --region {{ aws_region }} $EP --query SecretString --output text
+      register: gh_secret
+      no_log: true
+      changed_when: false
+      failed_when: false
+
+    - name: Fail early when the token secret is missing
+      ansible.builtin.fail:
+        msg: >-
+          Could not read secret "{{ secret_id_github }}" from Secrets Manager.
+          Populate it first using playbooks/1.manage-secrets.yml.
+          Token requires WRITE permission to allow CodeBuild to update image tags in gitops/workloads/.
+      when: gh_secret.rc != 0 or (gh_secret.stdout | default('') | trim | length) == 0
+
+    - name: Bind the token for this run
+      ansible.builtin.set_fact:
+        github_token: "{{ gh_secret.stdout | trim }}"
+      no_log: true
+
+    - name: Clone source code from GitHub
+      ansible.builtin.git:
+        repo: "https://{{ github_token }}@{{ github_repo }}"
+        dest: "{{ repo_dir }}"
+        version: "{{ git_branch }}"
+        force: true
+      no_log: true
+
+    # ── Clear NodePort 30080 before ingress-nginx sync ────────────────────────────
+    - name: Release NodePort 30080 from any service that is not ingress-nginx
+      ansible.builtin.shell: |
+        set -e
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        HOLDERS=$($K get svc -A \
+          -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"="}{range .spec.ports[*]}{.nodePort}{","}{end}{"\n"}{end}' \
+          | grep -E '=(.*,)?30080(,|$)' | cut -d= -f1 || true)
+        for S in $HOLDERS; do
+          [ "$S" = "ingress-nginx/ingress-nginx-controller" ] && continue
+          echo "releasing 30080 held by $S"
+          $K delete svc "${S#*/}" -n "${S%/*}"
+        done
+      register: port_release
+      changed_when: "'releasing' in port_release.stdout"
+      when: is_local == "true"
+
+    - name: Create the observability namespace
+      ansible.builtin.shell: >-
+        {{ kubectl }} create namespace observability --kubeconfig {{ kubeconfig }}
+        --dry-run=client -o yaml | {{ kubectl }} apply --kubeconfig {{ kubeconfig }} -f -
+      changed_when: true
+
+    - name: Register the EKS node in the SigNoz ALB target group
+      ansible.builtin.shell: |
+        set -e
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        NODE_IP=$($K get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        TG=$(aws elbv2 describe-target-groups --names {{ project_name }}-signoz-tg                --endpoint-url {{ aws_endpoint }}                --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null) || exit 0
+        [ -z "$TG" ] && exit 0
+        aws elbv2 register-targets --target-group-arn "$TG"           --targets Id=${NODE_IP},Port=30083 --endpoint-url {{ aws_endpoint }}
+        echo "registered ${NODE_IP}:30083"
+      register: signoz_target
+      changed_when: "'registered' in signoz_target.stdout"
+      failed_when: false
+      when: is_local == "true"
+
+    # ── ArgoCD ──────────────────────────────────────────────────────────────────────
+    - name: Create the ArgoCD namespace
+      ansible.builtin.shell: >-
+        {{ kubectl }} create namespace {{ argocd_namespace }}
+        --dry-run=client -o yaml --kubeconfig {{ kubeconfig }}
+        | {{ kubectl }} apply -f - --kubeconfig {{ kubeconfig }}
+      register: argocd_ns
+      changed_when: "'created' in argocd_ns.stdout"
+
+    - name: Install ArgoCD
+      ansible.builtin.shell: >-
+        {{ kubectl }} apply -n {{ argocd_namespace }}
+        -f {{ repo_dir }}/{{ argocd_manifest }}
+        --kubeconfig {{ kubeconfig }}
+      register: argocd_install
+      changed_when: "'configured' in argocd_install.stdout or 'created' in argocd_install.stdout"
+
+    - name: Configure argocd-server
+      ansible.builtin.shell: |
+        set -e
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        $K apply -f {{ repo_dir }}/gitops/bootstrap/argocd/server-params-cm.yaml
+        $K apply -f {{ repo_dir }}/gitops/bootstrap/argocd/nodeport-svc.yaml
+      register: argocd_params
+      changed_when: "'configured' in argocd_params.stdout or 'created' in argocd_params.stdout"
+
+    - name: Restart argocd-server to pick up the new params
+      ansible.builtin.shell: >-
+        {{ kubectl }} -n {{ argocd_namespace }} rollout restart deployment/argocd-server
+        --kubeconfig {{ kubeconfig }}
+      when: argocd_params.changed
+
+    - name: Wait for ArgoCD to be ready
+      ansible.builtin.shell: |
+        set -e
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }} -n {{ argocd_namespace }}"
+        $K rollout status deployment/argocd-repo-server --timeout=600s
+        $K rollout status deployment/argocd-server --timeout=600s
+        $K rollout status statefulset/argocd-application-controller --timeout=600s
+      changed_when: false
+
+    - name: Register the git repository with ArgoCD
+      ansible.builtin.shell: |
+        set -e
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        $K -n {{ argocd_namespace }} create secret generic learn-opensible-repo \
+          --from-literal=type=git \
+          --from-literal=url=https://{{ github_repo }} \
+          --from-literal=username=git \
+          --from-literal=password='{{ github_token }}' \
+          --dry-run=client -o yaml \
+          | $K apply -f -
+        $K -n {{ argocd_namespace }} label secret learn-opensible-repo \
+          argocd.argoproj.io/secret-type=repository --overwrite
+      no_log: true
+      changed_when: true
+
+    # ── Migration: Hand over manual Applications to ApplicationSet ───────────────
+    - name: Hand hand-made Applications over to the ApplicationSet
+      ansible.builtin.shell: |
+        set -e
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        ROWS=$($K -n {{ argocd_namespace }} get applications -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.metadata.ownerReferences[0].kind}{"\n"}{end}' 2>/dev/null || true)
+        for ROW in $ROWS; do
+          NAME=$(echo "$ROW" | cut -d'|' -f1)
+          OWNER=$(echo "$ROW" | cut -d'|' -f2)
+          if [ -z "$OWNER" ] && [ -n "$NAME" ]; then
+            echo "handing over legacy Application $NAME"
+            $K -n {{ argocd_namespace }} patch application "$NAME" \
+              --type=merge -p '{"metadata":{"finalizers":null}}'
+            $K -n {{ argocd_namespace }} delete application "$NAME"
+          fi
+        done
+      register: handed_over
+      changed_when: "'handing over' in handed_over.stdout"
+
+    # ── Hand the rest over to ArgoCD ──────────────────────────────────────────────
+    - name: Apply the ApplicationSet
+      ansible.builtin.shell: >-
+        {{ kubectl }} apply -f {{ repo_dir }}/{{ appset_manifest }}
+        --kubeconfig {{ kubeconfig }}
+      register: appset_apply
+      changed_when: "'configured' in appset_apply.stdout or 'created' in appset_apply.stdout"
+
+    - name: Wait for the ApplicationSet to generate its Applications
+      ansible.builtin.shell: >-
+        {{ kubectl }} -n {{ argocd_namespace }} get applications
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+        --kubeconfig {{ kubeconfig }}
+      register: generated_apps
+      until: (generated_apps.stdout_lines | length) >= 10
+      retries: 30
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: Report what the ApplicationSet generated
+      ansible.builtin.debug:
+        msg:
+          - "Applications generated by ApplicationSet: {{ generated_apps.stdout_lines | default([]) | join(', ') }}"
+          - "{{ 'Count OK.' if (generated_apps.stdout_lines | default([]) | length) >= 10 else 'INSUFFICIENT — check repo credentials and paths in gitops/bootstrap/appset.yaml' }}"
+
+    - name: Fail if the ApplicationSet generated too few Applications
+      ansible.builtin.assert:
+        that:
+          - (generated_apps.stdout_lines | default([]) | length) >= 10
+        fail_msg: >-
+          ApplicationSet generated only {{ generated_apps.stdout_lines | default([]) | length }}
+          Applications, minimum 10 required. Generator cannot access repo or path in
+          gitops/bootstrap/appset.yaml is incorrect.
+          Inspect with: "kubectl -n {{ argocd_namespace }} describe applicationset learn-opensible"
+        success_msg: "All {{ generated_apps.stdout_lines | default([]) | length }} Applications present."
+
+    - name: Register the EKS node in the ArgoCD ALB target group
+      ansible.builtin.shell: |
+        set -e
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        NODE_IP=$($K get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        TG=$(aws elbv2 describe-target-groups --names {{ project_name }}-argocd-tg \
+               --endpoint-url {{ aws_endpoint }} \
+               --query 'TargetGroups[0].TargetGroupArn' --output text)
+        aws elbv2 register-targets --target-group-arn "$TG" \
+          --targets Id=${NODE_IP},Port=30081 --endpoint-url {{ aws_endpoint }}
+        echo "registered ${NODE_IP}:30081"
+      register: argocd_target
+      changed_when: "'registered' in argocd_target.stdout"
+      when: is_local == "true"
+
+    - name: Wait for every Application to reach Synced
+      ansible.builtin.shell: >-
+        {{ kubectl }} -n {{ argocd_namespace }} get applications
+        -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.sync.status}{"\\n"}{end}'
+        --kubeconfig {{ kubeconfig }}
+      register: sync_state
+      until: >-
+        (sync_state.stdout_lines | length) >= 10 and
+        (sync_state.stdout_lines | select('search', '=Synced$') | list | length)
+        == (sync_state.stdout_lines | length)
+      retries: 60
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Show platform status
+      ansible.builtin.shell: |
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        echo "--- ArgoCD Applications (generated by ApplicationSet) ---"
+        $K -n {{ argocd_namespace }} get applications -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REVISION:.status.sync.revision' 2>/dev/null || true
+        echo "--- App workloads ---"
+        $K -n devops-apps get deployment,svc,ingress,hpa 2>/dev/null || echo "(empty — ArgoCD sync in progress)"
+        echo "--- Access ArgoCD UI ---"
+        ALB=$(aws elbv2 describe-load-balancers --names {{ project_name }}-argocd-alb \
+                --endpoint-url {{ aws_endpoint }} \
+                --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null)
+        echo "  http://${ALB}:4566/          (ArgoCD on dedicated root hostname)"
+        echo "  or: kubectl port-forward -n argocd svc/argocd-server 8080:80"
+        echo "  user: admin"
+        printf "  pass: "
+        $K -n {{ argocd_namespace }} get secret argocd-initial-admin-secret \
+          -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "(secret not ready)"
+        echo
+        echo "--- Observability ---"
+        $K -n observability get deployment,daemonset,svc 2>/dev/null || true
+        echo "--- Access SigNoz UI ---"
+        SZALB=$(aws elbv2 describe-load-balancers --names {{ project_name }}-signoz-alb \
+                  --endpoint-url {{ aws_endpoint }} \
+                  --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null)
+        echo "  http://${SZALB}:4566/       (dedicated hostname, served at root)"
+        echo "  or: kubectl port-forward -n signoz svc/signoz 8080:8080"
+        echo "  account: create on first login — SigNoz has no default password"
+        echo
+        $K -n signoz get statefulset,deployment 2>/dev/null || true
+        echo
+      register: platform_status
+      changed_when: false
+      failed_when: false
+
+    - name: Platform status
+      ansible.builtin.debug:
+        var: platform_status.stdout_lines

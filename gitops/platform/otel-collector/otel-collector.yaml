@@ -1,0 +1,200 @@
+# OpenTelemetry Collector — the single collection point.
+#
+# Applications know one address: the Collector. Only the Collector knows the backend. Swapping
+# SigNoz for Tempo, Jaeger or Datadog is a few lines in its ConfigMap — no application change,
+# no rebuild, no redeploy. Not theory: OpenObserve and SigNoz ran in parallel through this exact
+# layer, and removing OpenObserve cost one exporter and one directory.
+#
+# A DaemonSet rather than a Deployment because it reads container logs from /var/log/pods on
+# each node, which needs one instance per node. The same instance also receives OTLP from
+# applications, so one workload covers both.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: observability
+---
+# Read-only throughout: no create, update or delete. Wide horizontally (many resource kinds),
+# shallow vertically (look, never touch) — the right shape for something whose job is to watch.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+rules:
+  # For the k8sattributes processor: looks pods up to attach k8s.pod.name, k8s.namespace.name
+  # and k8s.node.name to every span and log.
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+
+  # ── For kubeletstats, and the one deliberate exception in this repo ──────────
+  #
+  # Kubelet authorises by PATH, not by Kubernetes resource name:
+  #
+  #     /stats/*    ->  nodes/stats
+  #     /metrics/*  ->  nodes/metrics
+  #     /logs/*     ->  nodes/log
+  #     everything else, including /pods and /exec and /run  ->  nodes/proxy
+  #
+  # The receiver calls both /stats/summary (the numbers) and /pods (requests, limits, the PVC
+  # name behind each volume). Without /pods the four *_utilization metrics cannot be computed,
+  # k8s.persistentvolumeclaim.name never appears, and — worst — the scraper returns EMPTY,
+  # taking memory.working_set and cpu.usage with it.
+  #
+  # Paid for this exactly here: granting "nodes/pods" (a plausible name the docs also use) is
+  # still refused by kubelet, and the symptom reads as something else entirely — Collector
+  # Healthy, traces flowing, just a 403 every 30 seconds and every SigNoz Kubernetes screen blank.
+  #
+  # nodes/proxy also opens /exec and /run, i.e. arbitrary commands in any container on any node.
+  # NEVER grant it to an application — see gitops/workloads/disk-service/rbac.yaml. Accepted for
+  # the Collector alone because it already sits at node-infrastructure level: DaemonSet on every
+  # node, runAsUser 0, hostPath /var/log/pods. Anyone who takes it over can already read every
+  # pod's logs, so nodes/proxy adds no new tier of privilege.
+  - apiGroups: [""]
+    resources: ["nodes/stats", "nodes/proxy"]
+    verbs: ["get"]
+
+  # For the k8s_cluster receiver: the cluster-wide inventory behind SigNoz's Rancher-style
+  # screens — pod status, deployment replicas, node conditions.
+  - apiGroups: [""]
+    resources: ["events", "services", "resourcequotas", "replicationcontrollers", "persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: observability
+roleRef:
+  kind: ClusterRole
+  name: otel-collector
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector
+  namespace: observability
+  labels:
+    app: otel-collector
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      serviceAccountName: otel-collector
+      terminationGracePeriodSeconds: 30
+      # Run on EVERY node, tainted ones included. Without this the DaemonSet skips the
+      # control-plane node and the logs of everything running there disappear. Measured here:
+      # `desired` was 2 instead of 3, and four kube-system pods were missed — including
+      # metrics-server and coredns, which are exactly what you need to see when cpu/memory-service
+      # degrade or when services fail to reach each other.
+      #
+      # `operator: Exists` with no key means "tolerate anything", the normal shape for a
+      # node-level agent and quite different from an ordinary workload.
+      tolerations:
+        - operator: Exists
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.159.0
+          args:
+            - --config=/conf/config.yaml
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          env:
+            # The cheapest way to get k8s.cluster.name, which every SigNoz Kubernetes screen
+            # filters on. The resourcedetection processor already enables the `env` detector, and
+            # that detector reads this standard variable — no extra processor, no pipeline change.
+            #
+            # Static because k3d has no cloud metadata to discover. On EKS/GKE/AKS the matching
+            # detector fills it in and this can go.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: k8s.cluster.name=learn-opensible
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            # Reading /var/log/pods needs root: the files are root-owned and the symlinks point
+            # into /var/lib/docker. A deliberate exception, offset by dropping every capability
+            # and mounting read-only.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            # Files under /var/log/pods are usually symlinks into here. Without this mount the
+            # filenames are readable but the contents are not.
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+---
+# A Service in front of a DaemonSet load-balances to any node, not necessarily the one the
+# caller runs on. Fine for a lab. To avoid the extra network hop in production, point
+# applications at the Collector on their OWN node via status.hostIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: observability
+  labels:
+    app: otel-collector
+spec:
+  type: ClusterIP
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http

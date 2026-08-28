@@ -1,0 +1,40 @@
+# ==============================================================================
+# # RBAC for memory-service alone.
+# ==============================================================================
+#
+# # These three services once shared one ServiceAccount, which forced the ClusterRole to be
+# # the UNION of every permission: this service was granted nodes/stats it never calls.
+# # Only disk-service needs that.
+#
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: memory-service
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: memory-service-reader
+rules:
+  # Node identity, capacity, allocatable, labels, conditions.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  # Actual usage from metrics-server. No nodes/stats here: this service never calls kubelet.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: memory-service-reader
+subjects:
+  - kind: ServiceAccount
+    name: memory-service
+    namespace: devops-apps
+roleRef:
+  kind: ClusterRole
+  name: memory-service-reader
+  apiGroup: rbac.authorization.k8s.io

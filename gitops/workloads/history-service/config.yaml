@@ -1,0 +1,6 @@
+# Kafka consumer (Python). No Kubernetes API access at all.
+name: history-service
+namespace: devops-apps
+manifestPath: gitops/workloads/history-service
+syncWave: "35"
+prune: "true"

@@ -1,0 +1,6 @@
+# HTTP gateway (Go). Fans out to the three metric services.
+name: rest-service
+namespace: devops-apps
+manifestPath: gitops/workloads/rest-service
+syncWave: "35"
+prune: "true"

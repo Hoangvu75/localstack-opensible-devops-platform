@@ -1,0 +1,7 @@
+# Next.js frontend. Resources were renamed from devops-hello-world to web, which is a
+# delete-and-recreate, so the first sync after that change has a short gap.
+name: web
+namespace: devops-apps
+manifestPath: gitops/workloads/web
+syncWave: "35"
+prune: "true"

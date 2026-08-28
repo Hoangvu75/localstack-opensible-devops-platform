@@ -1,0 +1,6 @@
+# Node memory metrics (Python). Has its own ServiceAccount and ClusterRole.
+name: memory-service
+namespace: devops-apps
+manifestPath: gitops/workloads/memory-service
+syncWave: "35"
+prune: "true"

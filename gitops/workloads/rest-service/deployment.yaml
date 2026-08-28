@@ -1,0 +1,86 @@
+# rest-service — the single HTTP gateway.
+#
+# The image name is BARE: no registry, no tag. Kustomize's `images:` block supplies both, and
+# that block is what CI writes and what ArgoCD notices. The base must not know its environment.
+#
+# No ServiceAccount and automountServiceAccountToken: false — this service never touches the
+# Kubernetes API, and the only publicly reachable port is also the largest attack surface.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rest-service
+  labels:
+    app: rest-service
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: rest-service
+  template:
+    metadata:
+      labels:
+        app: rest-service
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        # 65532, not the 1000 the other three use: this service is Go on
+        # gcr.io/distroless/static-debian12:nonroot, which fixes uid 65532 and has no shell to
+        # create another user. A polyglot repo cannot share one securityContext number.
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rest-service
+          image: learn-opensible-rest-service
+          ports:
+            - name: http
+              containerPort: 4000
+          env:
+            # The name shown on the service map. Changing it here relabels; it does not touch
+            # code, because telemetry.go reads this variable.
+            - name: OTEL_SERVICE_NAME
+              value: "rest-service"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability.svc.cluster.local:4318"
+            # Set here as well as in the Instrumentation CR: rest-service is the one service
+            # that builds its own SDK, so it does not inherit that config. See README §9.7.
+            - name: OTEL_BSP_SCHEDULE_DELAY
+              value: "1000"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          # /health = the process is alive. /ready = it can actually serve. Keeping them
+          # separate matters: a single always-UP /health sends traffic to a pod that cannot work.
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

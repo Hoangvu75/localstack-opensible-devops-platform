@@ -1,0 +1,7 @@
+# Injects language agents via pod annotations. Wave 15: the Instrumentation CRD must exist
+# before any workload references it, or the sync fails.
+name: otel-operator
+namespace: opentelemetry-operator-system
+manifestPath: gitops/platform/otel-operator
+syncWave: "15"
+prune: "true"

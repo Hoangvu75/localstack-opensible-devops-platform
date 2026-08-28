@@ -1,0 +1,81 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# memory-service
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-service
+  labels:
+    app: memory-service
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: memory-service
+  template:
+    metadata:
+      # This one line replaces the agent that used to be baked into the Dockerfile. The Operator
+      # adds an init container, mounts the agent and sets the OTEL_* variables from the
+      # Instrumentation CR named "devops-apps". The image knows nothing about OpenTelemetry.
+      annotations:
+        instrumentation.opentelemetry.io/inject-python: "true"
+      labels:
+        app: memory-service
+    spec:
+      serviceAccountName: memory-service
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: memory-service
+          image: learn-opensible-memory-service
+          ports:
+            - name: http
+              containerPort: 4002
+          env:
+            # The name shown on the service map — a label change, not a code change.
+            - name: OTEL_SERVICE_NAME
+              value: "memory-service"
+            - name: KAFKA_BROKERS
+              value: "redpanda.redpanda.svc.cluster.local:9092"
+            - name: METRICS_TOPIC
+              value: "node-metrics"
+            # Endpoint, protocol and batch delay are NOT declared here: the Instrumentation CR
+            # (instrumentation.yaml) is their single home, injected by the Operator at pod creation.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

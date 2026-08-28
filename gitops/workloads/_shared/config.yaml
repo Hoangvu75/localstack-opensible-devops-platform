@@ -1,0 +1,12 @@
+# Namespace, Instrumentation CR and Ingress — the three things no single service owns.
+# Wave 30, before every service (35): a pod that starts without the Instrumentation CR comes
+# up healthy and completely untraced, with no error anywhere.
+#
+# prune=true, with the Namespace itself protected by an annotation in namespace.yaml.
+# Disabling prune for the whole Application to protect one resource is the wrong level:
+# it once deadlocked an Ingress rename against the nginx admission webhook. See README §3.3.
+name: shared
+namespace: devops-apps
+manifestPath: gitops/workloads/_shared
+syncWave: "30"
+prune: "true"

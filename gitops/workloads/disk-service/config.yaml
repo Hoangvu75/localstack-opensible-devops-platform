@@ -1,0 +1,6 @@
+# Node disk metrics (Java). Own ServiceAccount, and the only one granted nodes/stats.
+name: disk-service
+namespace: devops-apps
+manifestPath: gitops/workloads/disk-service
+syncWave: "35"
+prune: "true"

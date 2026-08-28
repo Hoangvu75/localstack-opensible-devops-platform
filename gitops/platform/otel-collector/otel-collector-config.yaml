@@ -1,0 +1,227 @@
+receivers:
+  # OTLP from applications instrumented by the injected agents.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Node, pod, container and volume metrics from the kubelet on THIS node.
+  kubeletstats:
+    collection_interval: 30s
+    auth_type: serviceAccount
+    endpoint: "https://${env:K8S_NODE_NAME}:10250"
+    # The kubelet serving cert is signed by the cluster CA every pod mounts, so verification
+    # stays on. Many guides disable it here; there is no need.
+    insecure_skip_verify: false
+    metric_groups: [node, pod, container, volume]
+
+    # Without this, volume metrics carry only k8s.volume.name ("data", "config") — identical
+    # across pods and impossible to trace back to a PVC. Enabling it makes the receiver read
+    # pod specs and attach k8s.persistentvolumeclaim.name.
+    extra_metadata_labels:
+      - k8s.volume.type
+
+    # Required by extra_metadata_labels and by every *_utilization metric below: those are
+    # ratios against the requests and limits declared in the pod spec, which only the API
+    # server knows.
+    #
+    # Both depend on nodes/proxy in the ClusterRole. Kubelet authorises by PATH, and /pods maps
+    # to nodes/proxy — not to the nodes/pods that the docs suggest. Getting this wrong fails
+    # loudly in the log and silently everywhere else: a /pods error aborts the WHOLE scrape,
+    # so even memory.working_set disappears. See otel-collector.yaml.
+    k8s_api_config:
+      auth_type: serviceAccount
+    node: "${env:K8S_NODE_NAME}"
+
+    # Not enabled by default. SigNoz's Kubernetes screens read exactly these names; without
+    # them the tables render rows full of dashes. Its "Instrumentation checks" panel names the
+    # missing ones, which beats guessing.
+    #
+    # Note container.cpu.usage, NOT k8s.container.cpu.usage — container-level metrics live in
+    # the container.* namespace. An invalid key here stops the Collector from starting.
+    metrics:
+      k8s.pod.cpu.usage:
+        enabled: true
+      k8s.node.cpu.usage:
+        enabled: true
+      container.cpu.usage:
+        enabled: true
+      k8s.pod.cpu_request_utilization:
+        enabled: true
+      k8s.pod.cpu_limit_utilization:
+        enabled: true
+      k8s.pod.memory_request_utilization:
+        enabled: true
+      k8s.pod.memory_limit_utilization:
+        enabled: true
+      k8s.container.cpu_request_utilization:
+        enabled: true
+      k8s.container.cpu_limit_utilization:
+        enabled: true
+      k8s.container.memory_request_utilization:
+        enabled: true
+      k8s.container.memory_limit_utilization:
+        enabled: true
+
+  # Cluster-wide inventory: pod phase, deployment replicas, node conditions.
+  k8s_cluster:
+    collection_interval: 30s
+    node_conditions_to_report: [Ready, MemoryPressure, DiskPressure, PIDPressure]
+    allocatable_types_to_report: [cpu, memory, ephemeral-storage, pods]
+    # Answers "why is the pod in that state" — Evicted, NodeLost, UnexpectedAdmissionError.
+    metrics:
+      k8s.pod.status_reason:
+        enabled: true
+      k8s.container.status.reason:
+        enabled: true
+
+  # Redpanda's own metrics. Traces show how long a message spent in the queue; only these say
+  # why. Redpanda emits no traces at all — 564 config keys, none about tracing.
+  #
+  # Service discovery rather than a static address: this Collector is a DaemonSet with one pod
+  # per node, and a static target would make all three scrape the same broker, silently
+  # tripling every number. The first relabel rule keeps only pods on THIS node.
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: redpanda
+          scrape_interval: 30s
+          # /public_metrics is the curated set. /metrics is everything, down to seastar shards.
+          metrics_path: /public_metrics
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [redpanda]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_node_name]
+              regex: ${env:K8S_NODE_NAME}
+              action: keep
+            # The pod exposes both 9092 and 9644; without this the receiver also tries the
+            # Kafka port and logs an error every 30 seconds.
+            - source_labels: [__meta_kubernetes_pod_container_port_name]
+              regex: admin
+              action: keep
+
+  # Logs from every pod, with no application change at all.
+  filelog:
+    include: [ /var/log/pods/*/*/*.log ]
+    # Excluding this namespace stops the Collector from ingesting its own output and feeding
+    # itself in a loop.
+    exclude: [ /var/log/pods/observability_*/*/*.log ]
+    start_at: end
+    include_file_path: true
+    operators:
+      - type: container
+        id: container-parser
+
+processors:
+  # Kubernetes probes /health and /ready every few seconds for every pod, forever. Measured on
+  # this cluster before filtering: 3753 GET /ready spans against 206 real requests in 24 hours.
+  #
+  # The path list must stay in sync with what the services actually expose. A business endpoint
+  # was once named /metrics, matched this regex, and lost its SERVER spans — the trace looked
+  # flat and nothing reported an error. It is /api/metrics now.
+  filter/health:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["url.path"] != nil and IsMatch(attributes["url.path"], "^/(health|ready|healthz|metrics)$")'
+        - 'attributes["http.target"] != nil and IsMatch(attributes["http.target"], "^/(health|ready|healthz|metrics)$")'
+
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+  # Percentages rather than absolute values, so the DaemonSet needs no per-node tuning.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    # Eleven fields, not five. SigNoz's Kubernetes screens look workloads up by name, and a
+    # missing field renders an EMPTY screen rather than an error. k8s.pod.start_time is what
+    # the Age column is computed from.
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.node.name
+        - k8s.node.uid
+        - k8s.container.name
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.cronjob.name
+        - k8s.job.name
+        - k8s.pod.start_time
+
+    # ORDER MATTERS — the first matching rule wins.
+    #
+    # The last two rules only work for signals that crossed the network. Metrics from
+    # kubeletstats did not: the Collector read them from the kubelet, so they have no pod IP
+    # and no connection. Without the first two rules, infrastructure metrics arrive unenriched
+    # and every Kubernetes screen is empty while data keeps flowing.
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.uid
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.name
+          - from: resource_attribute
+            name: k8s.namespace.name
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.ip
+      - sources:
+          - from: connection
+
+  resourcedetection:
+    # env reads OTEL_RESOURCE_ATTRIBUTES from the Collector's own environment, which is how
+    # k8s.cluster.name gets set — see otel-collector.yaml. system supplies host and arch.
+    detectors: [env, system]
+    timeout: 5s
+
+exporters:
+  # The only backend. Applications never learn it exists; swapping it is one exporter and no
+  # service rebuild. OpenObserve ran here in parallel for a while — see README §9.2.
+  otlp/signoz:
+    endpoint: signoz-otel-collector.signoz.svc.cluster.local:4317
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 60s
+    sending_queue:
+      enabled: true
+      queue_size: 100
+
+  # Swap into a pipeline temporarily and read `kubectl logs` to inspect data in place.
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/health, k8sattributes, resourcedetection, batch]
+      exporters: [otlp/signoz]
+    metrics:
+      # Before kubeletstats and k8s_cluster were added this pipeline received nothing: otlp was
+      # the only source, and every service sets OTEL_METRICS_EXPORTER=none.
+      receivers: [otlp, kubeletstats, k8s_cluster, prometheus]
+      processors: [memory_limiter, k8sattributes, resourcedetection, batch]
+      exporters: [otlp/signoz]
+    logs:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, k8sattributes, resourcedetection, batch]
+      exporters: [otlp/signoz]

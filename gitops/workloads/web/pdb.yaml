@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+spec:
+  # Voluntary disruption (node drain, cluster upgrade) must always leave one pod serving.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: web

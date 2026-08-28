@@ -1,0 +1,32 @@
+# NodePort Service giving the ArgoCD ALB something to point at.
+#
+# A second Service rather than editing argocd-server: the original belongs to install.yaml
+# and any later kubectl apply would overwrite the change. This one survives upgrades.
+#
+# Straight to a NodePort instead of through ingress-nginx because ArgoCD gets its OWN
+# hostname, so it serves at "/" and needs no path or host routing — exactly what removed
+# the subpath mess documented in server-params-cm.yaml.
+#
+# targetPort 8080 is the plain-HTTP port, available thanks to server.insecure.
+#
+#
+#
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server-nodeport
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-server-nodeport
+    app.kubernetes.io/part-of: argocd
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      # Must match aws_lb_target_group.argocd (iac/alb-argocd.tf) and the port that
+      # 2.deploy-cloud-infra.yml registers into the target group.
+      nodePort: 30081
+  selector:
+    app.kubernetes.io/name: argocd-server

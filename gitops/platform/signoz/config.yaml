@@ -1,0 +1,11 @@
+# The observability backend. Wave 22, before the Collector (24) — the Collector retries its
+# exporter either way, but this order keeps the logs clean while ClickHouse starts.
+#
+# Chosen over OpenObserve after running both in parallel on identical data. It wins on the
+# built-in Kubernetes screens and on "Instrumentation checks", which names missing metrics
+# outright. It is also the heaviest component in the cluster. See README §9.2.
+name: signoz
+namespace: signoz
+manifestPath: gitops/platform/signoz
+syncWave: "22"
+prune: "true"

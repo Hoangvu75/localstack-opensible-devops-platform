@@ -1,0 +1,33 @@
+# argocd-server startup parameters.
+#
+#   server.insecure — argocd-server otherwise serves HTTPS with a self-signed cert, which
+#                     makes port-forward a browser warning and an HTTP ingress a 502. Plain
+#                     HTTP here; TLS is terminated by the layer in front (ingress/ALB).
+#
+# There is deliberately NO subpath configuration. Serving ArgoCD under /argocd through
+# ingress-nginx was tried and failed four different ways on v2.13.2 — none of them changed
+# the base href it emits, so the browser resolved assets wrongly and post-login redirects
+# doubled the prefix. (nginx really did send X-Forwarded-Prefix; the problem is on the
+# ArgoCD side.) ArgoCD belongs at the ROOT of its own hostname: port-forward locally, a
+# dedicated host on AWS. Neither needs rootpath or basehref.
+#
+# This ConfigMap overrides the empty one install.yaml creates — the supported way to
+# configure ArgoCD. Restart argocd-server for changes to take effect.
+#
+#
+# /argocd/argocd/applications:
+#
+#   server.basehref + ingress rewrite-target
+#
+#
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cmd-params-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-cmd-params-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  server.insecure: "true"

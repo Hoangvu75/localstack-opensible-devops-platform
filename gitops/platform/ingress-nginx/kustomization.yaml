@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Upstream v1.11.3 vendored into the repo: upgrades show up as a reviewable diff and deploys
+# need no external network. ONE local change — nodePort 30080, pinned to match the ALB target
+# group. Search for "LOCAL CHANGE" in the file.
+resources:
+  - controller-v1.11.3.yaml

@@ -1,0 +1,7 @@
+# Ingress layer. Wave 0: every Ingress in the repo needs the controller to exist first.
+# prune=false — pruning this by accident takes the whole cluster off the network.
+name: ingress-nginx
+namespace: ingress-nginx
+manifestPath: gitops/platform/ingress-nginx
+syncWave: "0"
+prune: "false"

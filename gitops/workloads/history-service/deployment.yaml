@@ -1,0 +1,73 @@
+# ==============================================================================
+# history-service — the Kafka consumer on the far side of the queue hop.
+#
+# Its CONSUMER span attaches straight to the trace of the request that produced the message,
+# even though that request already finished — because auto-instrumentation recognises
+# aiokafka. It is also the proof that "add a service and it is traced": the entire telemetry
+# story is the single annotation below.
+# ==============================================================================
+#
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: history-service
+  labels:
+    app: history-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: history-service
+  template:
+    metadata:
+      annotations:
+        instrumentation.opentelemetry.io/inject-python: "true"
+      labels:
+        app: history-service
+    spec:
+      # No token needed: this service never calls the Kubernetes API, it only reads Kafka.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: history-service
+          image: learn-opensible-history-service
+          ports:
+            - name: http
+              containerPort: 4004
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: "history-service"
+            - name: KAFKA_BROKERS
+              value: "redpanda.redpanda.svc.cluster.local:9092"
+            - name: METRICS_TOPIC
+              value: "node-metrics"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          # /ready reflects CONSUMER state, not process state. Unlike the other three, this service has
+          # nothing to serve until Kafka is connected — all of its data comes from there.
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi

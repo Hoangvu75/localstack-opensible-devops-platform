@@ -1,0 +1,373 @@
+---
+# Walks the public path back to front:
+#   Route53 -> CloudFront -> ALB -> EKS NodePort -> Pod
+# Every hop is probed independently and reported, so a broken chain tells you exactly
+# which link is down instead of just "the site doesn't load".
+#
+# Nothing here is destructive; the only write is re-registering the live EKS node in the
+# ALB target group, which is idempotent and needed whenever the k3d cluster is recreated
+# (the node gets a new IP and the old target goes stale).
+#
+# NOTE on probing: every LocalStack endpoint lives under *.localhost.localstack.cloud,
+# whose public DNS answers 127.0.0.1. Inside this container that loops back to the
+# container itself, so a plain curl always fails and tells you nothing. Every probe below
+# therefore uses `curl --resolve` to force the hostname onto LocalStack's real address
+# while still sending the correct Host header — which is what LocalStack routes on.
+- name: Verify public access path (Route53 -> CloudFront -> ALB -> EKS)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    aws_endpoint: "{{ lookup('env', 'AWS_ENDPOINT') | default('http://localstack:4566', true) }}"
+    aws_region: "{{ lookup('env', 'AWS_DEFAULT_REGION') | default('us-east-1', true) }}"
+    aws_host: "{{ aws_endpoint | regex_replace('^https?://', '') | regex_replace(':.*$', '') }}"
+
+    project_name: "learn-opensible"
+    node_port: 30080
+    kubeconfig: "/root/.kube/config"
+    kubectl: "/usr/local/bin/kubectl"
+
+    # LocalStack serves everything on its gateway port; 80 is probed too in case a
+    # dedicated listener exists.
+    probe_ports: "4566 80"
+
+  tasks:
+    # Container worker is ephemeral: ensure required CLI tools are present.
+    - name: Ensure CLI tooling is present
+      ansible.builtin.shell: |
+        set -e
+        if ! command -v aws >/dev/null 2>&1; then
+          curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+          unzip -q -o /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install --update
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+        fi
+        if [ ! -x /usr/local/bin/kubectl ]; then
+          curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.28.2/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+        fi
+        command -v dig >/dev/null 2>&1 || apt-get update -qq && apt-get install -y -qq dnsutils >/dev/null 2>&1 || true
+      changed_when: false
+      failed_when: false
+
+    - name: Resolve the LocalStack gateway address
+      ansible.builtin.shell: getent hosts {{ aws_host }} | awk '{print $1}' | head -n1
+      register: ls_ip
+      changed_when: false
+
+    # ── Hop 4 — the Pod itself, via the NodePort on the EKS node ──────────────────
+    - name: Get the EKS node internal IP
+      ansible.builtin.shell: >-
+        {{ kubectl }} get nodes
+        -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+        --kubeconfig {{ kubeconfig }}
+      register: node_ip
+      changed_when: false
+
+    - name: Check the app pods are running
+      ansible.builtin.shell: >-
+        {{ kubectl }} get pods -n devops-apps -o wide --kubeconfig {{ kubeconfig }}
+      register: pods
+      changed_when: false
+      failed_when: false
+
+    - name: Probe the NodePort directly
+      ansible.builtin.shell: >-
+        curl -sS -o /dev/null -m 10 -w '%{http_code}'
+        http://{{ node_ip.stdout | trim }}:{{ node_port }}/ || echo " unreachable"
+      register: hop_eks
+      changed_when: false
+      failed_when: false
+
+    # ── Hop 3 — ALB ───────────────────────────────────────────────────────────────
+    - name: Look up the ALB target group
+      ansible.builtin.shell: >-
+        aws elbv2 describe-target-groups --names {{ project_name }}-tg-ip
+        --region {{ aws_region }} --endpoint-url {{ aws_endpoint }}
+        --query 'TargetGroups[0].TargetGroupArn' --output text
+      register: tg_arn
+      changed_when: false
+
+    # The k3d node IP changes every time the cluster is rebuilt, which silently orphans
+    # the target registered by 2.deploy-cloud-infra.yml. Re-register the current one.
+    - name: Register the live node in the ALB target group
+      ansible.builtin.shell: >-
+        aws elbv2 register-targets
+        --target-group-arn {{ tg_arn.stdout | trim }}
+        --targets Id={{ node_ip.stdout | trim }},Port={{ node_port }}
+        --region {{ aws_region }} --endpoint-url {{ aws_endpoint }}
+      when: node_ip.stdout | trim != ""
+
+    - name: Show ALB target health
+      ansible.builtin.shell: >-
+        aws elbv2 describe-target-health --target-group-arn {{ tg_arn.stdout | trim }}
+        --region {{ aws_region }} --endpoint-url {{ aws_endpoint }}
+        --query 'TargetHealthDescriptions[].{target:Target.Id,port:Target.Port,state:TargetHealth.State,reason:TargetHealth.Reason}'
+        --output table
+      register: target_health
+      changed_when: false
+      failed_when: false
+
+    - name: Get the ALB DNS name
+      ansible.builtin.shell: >-
+        aws elbv2 describe-load-balancers --names {{ project_name }}-alb
+        --region {{ aws_region }} --endpoint-url {{ aws_endpoint }}
+        --query 'LoadBalancers[0].DNSName' --output text
+      register: alb_dns
+      changed_when: false
+
+    # Status code alone is not enough: report status code, downloaded bytes, and content type.
+    - name: Probe the ALB
+      ansible.builtin.shell: |
+        H="{{ alb_dns.stdout | trim }}"
+        for p in {{ probe_ports }}; do
+          out=$(curl -sS -o /dev/null -m 10 -w '%{http_code}  %{size_download} bytes  [%{content_type}]' \
+                   --resolve "$H:$p:{{ ls_ip.stdout | trim }}" "http://$H:$p/" 2>/dev/null) \
+            || out="unreachable"
+          echo "http://$H:$p/ -> $out"
+        done
+      register: hop_alb
+      changed_when: false
+      failed_when: false
+
+    - name: Bisect a Next.js static asset (ALB vs in-cluster)
+      ansible.builtin.shell: |
+        H="{{ alb_dns.stdout | trim }}"
+        R="--resolve $H:4566:{{ ls_ip.stdout | trim }}"
+        HTML=$(curl -sS -m 15 $R "http://$H:4566/" 2>/dev/null)
+        ASSET=$(echo "$HTML" | grep -o '/_next/static/[^"]*\.css' | head -n1)
+        if [ -z "$ASSET" ]; then
+          echo "no /_next/static/*.css link in the HTML — the served page is not the Next.js build"
+          echo "--- first 400 bytes ---"
+          echo "$HTML" | head -c 400
+          exit 0
+        fi
+        echo "asset: $ASSET"
+        out=$(curl -sS -o /dev/null -m 15 -w '%{http_code}  %{size_download} bytes  [%{content_type}]' \
+                $R "http://$H:4566$ASSET" 2>/dev/null) || out="unreachable"
+        echo "via ALB        -> $out   (must be text/css)"
+        if {{ kubectl }} get --raw \
+             "/api/v1/namespaces/devops-apps/services/web-svc:80/proxy$ASSET" \
+             --kubeconfig {{ kubeconfig }} > /tmp/asset.out 2>/tmp/asset.err; then
+          echo "via API proxy  -> OK ($(wc -c < /tmp/asset.out) bytes)"
+        else
+          echo "via API proxy  -> FAILED: $(head -c 200 /tmp/asset.err)"
+        fi
+
+        echo "--- discriminator (a): two requests over ONE connection ---"
+        curl -sS -m 20 $R -w '  %{url_effective} -> %{http_code}\n' \
+          -o /dev/null "http://$H:4566/" \
+          -o /dev/null "http://$H:4566$ASSET" 2>&1
+
+        echo "--- discriminator (b): fresh connection, browser headers ---"
+        curl -sS -o /dev/null -m 20 $R -w '  %{url_effective} -> %{http_code}\n' \
+          -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' \
+          -H 'Accept: text/css,*/*;q=0.1' \
+          -H 'Accept-Encoding: gzip, deflate' \
+          -H "Referer: http://$H:4566/" \
+          -H 'Sec-Fetch-Dest: style' \
+          -H 'Sec-Fetch-Mode: no-cors' \
+          -H 'Sec-Fetch-Site: same-origin' \
+          "http://$H:4566$ASSET" 2>&1
+
+        echo "--- body of a 403, if any ---"
+        curl -sS -m 20 $R "http://$H:4566$ASSET" \
+          -H 'Sec-Fetch-Dest: style' -H "Referer: http://$H:4566/" 2>/dev/null | head -c 300
+        echo
+      register: hop_asset
+      changed_when: false
+      failed_when: false
+
+    # ── Hop 2 — CloudFront ────────────────────────────────────────────────────────
+    - name: Get the CloudFront distribution domain
+      ansible.builtin.shell: >-
+        aws cloudfront list-distributions
+        --region {{ aws_region }} --endpoint-url {{ aws_endpoint }}
+        --query "DistributionList.Items[?contains(Comment, '{{ project_name }}')].DomainName | [0]"
+        --output text
+      register: cf_domain
+      changed_when: false
+      failed_when: false
+
+    - name: Probe CloudFront
+      ansible.builtin.shell: |
+        H="{{ cf_domain.stdout | trim }}"
+        R="--resolve $H:4566:{{ ls_ip.stdout | trim }}"
+        for p in {{ probe_ports }}; do
+          out=$(curl -sS -o /dev/null -m 15 -w '%{http_code}  %{size_download} bytes  [%{content_type}]' \
+                   --resolve "$H:$p:{{ ls_ip.stdout | trim }}" "http://$H:$p/" 2>/dev/null) \
+            || out="unreachable"
+          echo "http://$H:$p/ -> $out"
+        done
+        echo "--- response headers ---"
+        curl -sS -D - -o /dev/null -m 15 $R "http://$H:4566/" 2>/dev/null | head -n 15
+        echo "--- first 300 bytes of body ---"
+        curl -sS -m 15 $R "http://$H:4566/" 2>/dev/null | head -c 300
+        echo
+      register: hop_cf
+      changed_when: false
+      failed_when: false
+      when: cf_domain.stdout | trim not in ["", "None"]
+
+    # ── Hop 1 — Route53 ───────────────────────────────────────────────────────────
+    - name: Discover the hosted zone and its A record
+      ansible.builtin.shell: |
+        ZID=$(aws route53 list-hosted-zones \
+          --region {{ aws_region }} --endpoint-url {{ aws_endpoint }} \
+          --query 'HostedZones[0].Id' --output text)
+        NAME=$(aws route53 list-resource-record-sets --hosted-zone-id "$ZID" \
+          --region {{ aws_region }} --endpoint-url {{ aws_endpoint }} \
+          --query 'ResourceRecordSets[?Type==`A`].Name | [0]' --output text)
+        echo "$ZID"
+        echo "${NAME%.}"
+      register: r53
+      changed_when: false
+
+    - name: Show the Route53 record set
+      ansible.builtin.shell: >-
+        aws route53 list-resource-record-sets --hosted-zone-id "{{ r53.stdout_lines[0] }}"
+        --region {{ aws_region }} --endpoint-url {{ aws_endpoint }}
+        --query 'ResourceRecordSets[].{name:Name,type:Type,alias:AliasTarget.DNSName,value:ResourceRecords[0].Value}'
+        --output table
+      register: r53_records
+      changed_when: false
+      failed_when: false
+
+    - name: Resolve the record against LocalStack's DNS server
+      ansible.builtin.shell: >-
+        dig +short +timeout=5 @{{ aws_host }} {{ r53.stdout_lines[1] }} || echo "dns lookup failed"
+      register: r53_dig
+      changed_when: false
+      failed_when: false
+
+    - name: Probe the Route53 name end to end
+      ansible.builtin.shell: |
+        H="{{ r53.stdout_lines[1] }}"
+        for p in {{ probe_ports }}; do
+          out=$(curl -sS -o /dev/null -m 15 -w '%{http_code}  %{size_download} bytes  [%{content_type}]' \
+                   --resolve "$H:$p:{{ ls_ip.stdout | trim }}" "http://$H:$p/" 2>/dev/null) \
+            || out="unreachable"
+          echo "http://$H:$p/ -> $out"
+        done
+      register: hop_r53
+      changed_when: false
+      failed_when: false
+
+    - name: Control probe with a hostname no record points at
+      ansible.builtin.shell: |
+        H="definitely-not-a-record.localhost.localstack.cloud"
+        out=$(curl -sS -o /dev/null -m 15 -w '%{http_code}  %{size_download} bytes  [%{content_type}]' \
+                 --resolve "$H:4566:{{ ls_ip.stdout | trim }}" "http://$H:4566/" 2>/dev/null) \
+          || out="unreachable"
+        echo "http://$H:4566/ -> $out"
+      register: hop_control
+      changed_when: false
+      failed_when: false
+
+    # ── ArgoCD ────────────────────────────────────────────────────────────────────
+    - name: Collect ArgoCD access details
+      ansible.builtin.shell: |
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        echo "app        : $($K -n argocd get application web \
+              -o jsonpath='{.status.sync.status}/{.status.health.status}' 2>/dev/null || echo 'missing')"
+        echo "revision   : $($K -n argocd get application web \
+              -o jsonpath='{.status.sync.revision}' 2>/dev/null | cut -c1-7)"
+        echo "user       : admin"
+        PW=$($K -n argocd get secret argocd-initial-admin-secret \
+              -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null)
+        echo "password   : ${PW:-(secret removed — password was updated)}"
+      register: argocd_info
+      changed_when: false
+      failed_when: false
+
+    - name: Collect every ALB hostname
+      ansible.builtin.shell: |
+        aws elbv2 describe-load-balancers --names "{{ alb_name }}" \
+          --endpoint-url {{ aws_endpoint }} \
+          --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || echo "(not created)"
+      loop:
+        - "{{ project_name }}-alb"
+        - "{{ project_name }}-argocd-alb"
+        - "{{ project_name }}-signoz-alb"
+      loop_control:
+        loop_var: alb_name
+      register: alb_lookup
+      changed_when: false
+      failed_when: false
+
+    - name: Name the ALB hostnames
+      ansible.builtin.set_fact:
+        dns_app: "{{ alb_lookup.results[0].stdout | trim | default('(not created)', true) }}"
+        dns_argocd: "{{ alb_lookup.results[1].stdout | trim | default('(not created)', true) }}"
+        dns_signoz: "{{ alb_lookup.results[2].stdout | trim | default('(not created)', true) }}"
+
+    - name: Collect SigNoz access details
+      ansible.builtin.shell: |
+        K="{{ kubectl }} --kubeconfig {{ kubeconfig }}"
+        echo "signoz     : $($K -n signoz get statefulset signoz -o jsonpath='{.status.readyReplicas}/{.status.replicas}' 2>/dev/null || echo 'not installed')"
+        echo "collector  : $($K -n signoz get deploy signoz-otel-collector -o jsonpath='{.status.readyReplicas}/{.status.replicas}' 2>/dev/null || echo 'not installed')"
+        echo "clickhouse : $($K -n signoz get pods -l clickhouse.altinity.com/chi --no-headers 2>/dev/null | wc -l) pod"
+        echo "account    : create on first login — SigNoz has no default password"
+        echo "collector  : $($K -n observability get ds otel-collector -o jsonpath='{.status.numberReady}/{.status.desiredNumberScheduled}' 2>/dev/null || echo 'not installed') node"
+      register: signoz_info
+      changed_when: false
+      failed_when: false
+
+    # ── Report ────────────────────────────────────────────────────────────────────
+    - name: Chain report
+      ansible.builtin.debug:
+        msg:
+          - "localstack gateway: {{ ls_ip.stdout | trim }}"
+          - "══════════════ EKS (pods + NodePort) ══════════════"
+          - "{{ pods.stdout_lines | default([]) }}"
+          - "node ip: {{ node_ip.stdout | trim }}   NodePort {{ node_port }} -> HTTP {{ hop_eks.stdout | trim }}"
+          - "(the k3d node sits on its own docker network — 'unreachable' here can be normal"
+          - " from this container and does not by itself mean the ALB path is broken)"
+          - "══════════════ ALB ══════════════"
+          - "dns name: {{ alb_dns.stdout | trim }}"
+          - "{{ target_health.stdout_lines | default([]) }}"
+          - "{{ hop_alb.stdout_lines | default([]) }}"
+          - "── static asset bisect ──"
+          - "{{ hop_asset.stdout_lines | default([]) }}"
+          - "══════════════ CloudFront ══════════════"
+          - "domain: {{ cf_domain.stdout | trim }}"
+          - "{{ hop_cf.stdout_lines | default(['(skipped — no distribution found)']) }}"
+          - "══════════════ Route53 ══════════════"
+          - "{{ r53_records.stdout_lines | default([]) }}"
+          - "dig {{ r53.stdout_lines[1] }} -> {{ r53_dig.stdout_lines | default([]) }}"
+          - "{{ hop_r53.stdout_lines | default([]) }}"
+          - "control (hostname with no record at all):"
+          - "{{ hop_control.stdout_lines | default([]) }}"
+          - "══════════════ ArgoCD ══════════════"
+          - "{{ argocd_info.stdout_lines | default([]) }}"
+          - "══════════════ SigNoz (Observability) ══════════════"
+          - "{{ signoz_info.stdout_lines | default([]) }}"
+          - "══════════════ Configured ALBs ══════════════"
+          - "  app     : {{ dns_app }}"
+          - "  argocd  : {{ dns_argocd }}"
+          - "  signoz  : {{ dns_signoz }}"
+          - ""
+          - "══════════════ OPEN IN BROWSER ══════════════"
+          - ""
+          - "No hosts file modification required: localhost.localstack.cloud has wildcard DNS pointing to 127.0.0.1."
+          - "Each interface has a DEDICATED HOSTNAME and is served at root `/`."
+          - ""
+          - "  ① Web app (Next.js)          NodePort 30080 → ingress-nginx"
+          - "     ALB        : http://{{ alb_dns.stdout | trim }}:4566/"
+          - "     CloudFront : http://{{ cf_domain.stdout | trim }}:4566/"
+          - "     Route53    : http://{{ r53.stdout_lines[1] }}:4566/"
+          - "     API metrics: http://{{ alb_dns.stdout | trim }}:4566/api/k8s-metrics"
+          - ""
+          - "  ② ArgoCD  (GitOps)           NodePort 30081"
+          - "     http://{{ dns_argocd }}:4566/"
+          - "     fallback   : kubectl port-forward -n argocd svc/argocd-server 8080:80"
+          - "     user/pass listed in ArgoCD section above"
+          - ""
+          - "  ③ SigNoz  (logs/traces/metrics)  NodePort 30083"
+          - "     http://{{ dns_signoz }}:4566/"
+          - "     fallback   : kubectl port-forward -n signoz svc/signoz 8080:8080"
+          - "     Create admin account on first screen."
+          - ""
+          - "  If endpoints are unreachable, check if 'Configured ALBs' shows '(not created)'."
+          - "  Re-run 2.deploy-cloud-infra if ALBs need provisioning."
+          - "═════════════════════════════════════════════════"

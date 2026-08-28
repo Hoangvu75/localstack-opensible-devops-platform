@@ -1,0 +1,106 @@
+# The ONE file playbook 3 applies by hand. Everything else in gitops/ is discovered from here.
+#
+# Adding a platform component or a service is: create a directory and a six-line config.yaml.
+# No playbook edit, no hand-written Application, and the new thing gets selfHeal like the rest.
+#
+# Sync-wave order (why each one matters is in the component's own config.yaml):
+#
+#   0   ingress-nginx     15  otel-operator     30  _shared
+#   5   cert-manager      22  signoz            35  each service
+#   12  redpanda          24  otel-collector
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: learn-opensible
+  namespace: argocd
+spec:
+  # go-template allows `{{ .name }}` and, more usefully, errors on a missing field instead of
+  # substituting an empty string.
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  # false = removing a config.yaml really deletes its resources. Git is the source of truth for
+  # deletion too.
+  #
+  # This was true for a while, and the cost showed up the other way round: OpenObserve was
+  # removed from git, its Application vanished, and its Deployment, Service, PVC and Secret
+  # stayed forever with nothing managing them. "Safe" that way only trades data loss for
+  # silent litter.
+  #
+  # The real risk of false: if the generator ever returns an EMPTY list — repo unreachable,
+  # credentials expired, a wrong path — ArgoCD deletes the whole cluster. Two things reduce it,
+  # and they are NOT equivalent:
+  #
+  #   Prevention  the field below is `manifestPath`, not `path`. `path` is a RESERVED key of
+  #               the git files generator: it injects an object and overrides whatever you
+  #               declare, and the symptom is four Applications sitting at SYNC: Unknown while
+  #               HEALTH stays Healthy, deploying nothing, with no error anywhere.
+  #   Detection   playbook 3 asserts how many Applications were generated and fails if too few.
+  #               It only REPORTS — the application controller deletes asynchronously and does
+  #               not wait for a playbook.
+  syncPolicy:
+    preserveResourcesOnDeletion: false
+
+  generators:
+    - git:
+        repoURL: https://github.com/Hoangvu75/learn-opensible.git
+        revision: main
+        files:
+          - path: "gitops/platform/*/config.yaml"
+          - path: "gitops/workloads/*/config.yaml"
+
+  template:
+    metadata:
+      name: "{{ .name }}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{ .syncWave }}"
+        # ArgoCD's default text diff cannot converge on Helm-rendered manifests: charts emit
+        # empty fields (priorityClassName: "", args: null, resources.limits: {}) that Kubernetes
+        # strips on write, so git has them and the cluster does not — OutOfSync forever.
+        # ServerSideDiff asks the API server to dry-run the apply and compares the PREDICTED
+        # result, which drops empty fields on both sides. Hit exactly this with SigNoz.
+        argocd.argoproj.io/compare-options: ServerSideDiff=true
+    spec:
+      project: default
+      # LocalStack and the API server normalise these back, so they would diff forever.
+      ignoreDifferences:
+        - group: apps
+          kind: StatefulSet
+          jqPathExpressions:
+            - '.spec.volumeClaimTemplates[]?.apiVersion'
+            - '.spec.volumeClaimTemplates[]?.kind'
+            - '.spec.template.spec.containers[]?.env[]?.valueFrom?.resourceFieldRef?.divisor'
+        - group: apps
+          kind: Deployment
+          jqPathExpressions:
+            - '.spec.template.spec.containers[]?.env[]?.valueFrom?.resourceFieldRef?.divisor'
+      source:
+        repoURL: https://github.com/Hoangvu75/learn-opensible.git
+        targetRevision: main
+        path: "{{ .manifestPath }}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{ .namespace }}"
+      syncPolicy:
+        automated:
+          selfHeal: true
+          # Overridden per component by templatePatch below.
+          prune: false
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m
+
+  # prune is a BOOLEAN, and config.yaml holds it as a string. Writing `prune: {{ .prune }}`
+  # inside the template above produces `prune: "true"` and the manifest fails to parse.
+  # templatePatch is rendered as text before the merge, so the quotes disappear.
+  templatePatch: |
+    spec:
+      syncPolicy:
+        automated:
+          prune: {{ .prune }}

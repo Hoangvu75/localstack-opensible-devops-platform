@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devops-apps
+  annotations:
+    # Never prune this Namespace.
+    #
+    # Deleting it deletes EVERYTHING inside — six Deployments, Services, ConfigMaps, PVCs —
+    # including resources owned by other Applications. Nothing else in this repo has that
+    # blast radius. The scenario to block: manifestPath in _shared/config.yaml points
+    # somewhere wrong, ArgoCD concludes the Namespace left the source, and removes it.
+    #
+    # This is a RESOURCE-level guard, replacing the Application-level prune=false used
+    # before. That difference matters: Ingress and Instrumentation next to it prune normally
+    # again, so renaming them no longer deadlocks against the nginx admission webhook.
+    #
+    # LIMIT: it stops pruning during sync. It is not a shield against every delete path — if
+    # the "shared" Application itself is removed, ArgoCD finalizers clean up another way and
+    # this annotation does not intervene.
+    #
+    # To really delete the namespace, remove this annotation and commit. Deliberate, and
+    # reviewable.
+    #
+    #
+    #
+    #
+    #
+    argocd.argoproj.io/sync-options: Prune=false

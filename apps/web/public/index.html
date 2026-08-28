@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>This website is created for learning DevOps ✨</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root { --bg: #060112; --pink: #ff3cac; --purple: #784ba0; --blue: #2b86c5; --cyan: #00f5ff; --yellow: #ffe66d; }
+  html, body { width: 100%; min-height: 100%; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: white; overflow-x: hidden; }
+  body { min-height: 100vh; position: relative; isolation: isolate; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+  .aurora { position: fixed; inset: -30%; z-index: -3; background: radial-gradient(circle at 20% 30%, rgba(255, 60, 172, 0.45), transparent 28%), radial-gradient(circle at 80% 20%, rgba(0, 245, 255, 0.35), transparent 28%), radial-gradient(circle at 75% 80%, rgba(120, 75, 160, 0.5), transparent 32%), radial-gradient(circle at 25% 80%, rgba(43, 134, 197, 0.35), transparent 28%); filter: blur(50px); animation: drift 14s ease-in-out infinite alternate; }
+  .grid { position: fixed; inset: 0; z-index: -2; opacity: 0.16; background-image: linear-gradient(rgba(255, 255, 255, 0.12) 1px, transparent 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.12) 1px, transparent 1px); background-size: 50px 50px; mask-image: linear-gradient(to bottom, transparent, black 20%, black 80%, transparent); transform: perspective(500px) rotateX(55deg) scale(1.5); transform-origin: center bottom; }
+  .noise { position: fixed; inset: 0; z-index: 5; pointer-events: none; opacity: 0.03; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.8'/%3E%3C/svg%3E"); }
+  .orb { position: absolute; width: 300px; height: 300px; border-radius: 50%; filter: blur(2px); opacity: 0.35; mix-blend-mode: screen; }
+  .orb.one { top: 5%; left: 5%; background: radial-gradient(circle, #ff3cac, transparent 70%); animation: orbitOne 12s ease-in-out infinite; }
+  .orb.two { right: 5%; bottom: 5%; background: radial-gradient(circle, #00f5ff, transparent 70%); animation: orbitTwo 15s ease-in-out infinite; }
+  main { width: min(1080px, 92vw); padding: 40px 0; }
+  .card { position: relative; overflow: hidden; padding: clamp(40px, 6vw, 80px) clamp(24px, 5vw, 70px); border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 32px; background: linear-gradient(135deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.03)); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); box-shadow: 0 30px 100px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 0 80px rgba(255, 60, 172, 0.1); text-align: center; }
+  .badge { position: relative; z-index: 1; display: inline-flex; align-items: center; gap: 10px; padding: 8px 16px; margin-bottom: 24px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 999px; background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.9); font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .badge-dot { width: 8px; height: 8px; border-radius: 50%; background: #62ff9c; box-shadow: 0 0 12px #62ff9c; animation: pulse 1.8s infinite; }
+  h1 { position: relative; z-index: 1; font-size: clamp(38px, 6vw, 76px); line-height: 1.1; letter-spacing: -0.04em; font-weight: 900; background: linear-gradient(100deg, #fff 5%, #ffe66d 25%, #ff3cac 48%, #a56bff 67%, #00f5ff 92%); background-size: 250% auto; -webkit-background-clip: text; background-clip: text; color: transparent; animation: gradientMove 6s linear infinite; filter: drop-shadow(0 0 20px rgba(255, 60, 172, 0.2)); }
+  .subtitle { position: relative; z-index: 1; max-width: 680px; margin: 24px auto 0; color: rgba(255, 255, 255, 0.78); font-size: clamp(16px, 1.8vw, 20px); line-height: 1.7; font-weight: 400; }
+  .tech-grid { position: relative; z-index: 1; display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; margin-top: 36px; }
+  .tech-pill { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 14px; background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12); font-size: 14px; font-weight: 600; color: rgba(255, 255, 255, 0.9); transition: all 0.3s ease; }
+  .tech-pill:hover { background: rgba(255, 255, 255, 0.14); transform: translateY(-3px); border-color: rgba(255, 255, 255, 0.3); box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3); }
+  .buttons { position: relative; z-index: 1; display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; margin-top: 38px; }
+  .btn { border: 0; cursor: pointer; color: white; font: inherit; font-weight: 800; text-decoration: none; padding: 16px 28px; border-radius: 16px; transition: transform 0.25s, box-shadow 0.25s, background 0.25s; }
+  .btn-primary { background: linear-gradient(100deg, #ff3cac, #784ba0, #2b86c5); background-size: 200% auto; box-shadow: 0 12px 35px rgba(255, 60, 172, 0.3); animation: gradientMove 4s linear infinite; }
+  .btn-secondary { background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.16); }
+  .btn:hover { transform: translateY(-4px) scale(1.03); }
+  .btn-primary:hover { box-shadow: 0 18px 45px rgba(255, 60, 172, 0.45); }
+  .btn-secondary:hover { background: rgba(255, 255, 255, 0.15); }
+  footer { position: relative; z-index: 1; margin-top: 32px; color: rgba(255, 255, 255, 0.4); font-size: 13px; letter-spacing: 0.1em; text-transform: uppercase; }
+  @keyframes drift { to { transform: translate(5%, -4%) scale(1.08) rotate(5deg); } }
+  @keyframes gradientMove { to { background-position: 250% center; } }
+  @keyframes pulse { 50% { transform: scale(1.4); opacity: 0.6; } }
+  @keyframes orbitOne { 50% { transform: translate(100px, 60px) scale(1.15); } }
+  @keyframes orbitTwo { 50% { transform: translate(-100px, -60px) scale(0.85); } }
+</style>
+</head>
+<body>
+  <div class="aurora"></div>
+  <div class="grid"></div>
+  <div class="noise"></div>
+  <div class="orb one"></div>
+  <div class="orb two"></div>
+
+  <main>
+    <section class="card">
+      <div class="badge">
+        <span class="badge-dot"></span>
+        EKS Cluster Active • Floci K8s Engine
+      </div>
+      <h1>This website is created for learning DevOps ✨</h1>
+      <p class="subtitle">
+        Successfully deployed onto <strong>EKS Cluster (learn-opensible-dev)</strong> running on <strong>Floci</strong> using <strong>OpenSible GitOps & Ansible Pipelines</strong>.
+      </p>
+      <div class="tech-grid">
+        <div class="tech-pill"><span>⚡</span> Next.js 14</div>
+        <div class="tech-pill"><span>☸️</span> Amazon EKS (k3s)</div>
+        <div class="tech-pill"><span>🏗️</span> OpenTofu IaC</div>
+        <div class="tech-pill"><span>📜</span> Ansible Playbook</div>
+        <div class="tech-pill"><span>🚀</span> OpenSible Control Plane</div>
+        <div class="tech-pill"><span>☁️</span> Floci Emulator</div>
+      </div>
+      <div class="buttons">
+        <button class="btn btn-primary" onclick="alert('🚀 DevOps Pipeline Execution Success!\nEKS Cluster Status: ACTIVE\nDeployment: SUCCESSFUL')">🎉 Cluster Status: ACTIVE</button>
+        <a class="btn btn-secondary" href="http://localhost:4500/cloud-explorer/aws/k8s" target="_blank" rel="noreferrer">🔍 Open Floci Explorer →</a>
+      </div>
+      <footer>DEVOPS LEARNING LAB • OPENSIBLE & FLOCI EKS • NEXT.JS 14</footer>
+    </section>
+  </main>
+</body>
+</html>

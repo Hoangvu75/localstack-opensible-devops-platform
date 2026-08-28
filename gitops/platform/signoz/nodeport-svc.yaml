@@ -1,0 +1,35 @@
+# ==============================================================================
+# NodePort for the SigNoz UI — a SEPARATE file, leaving the Helm-rendered manifest untouched.
+#
+# The chart creates a ClusterIP Service named signoz. Rather than editing rendered output
+# that the next chart bump would overwrite, add a SECOND Service onto the same pods. Same
+# approach as gitops/bootstrap/argocd/nodeport-svc.yaml: upgrading is a re-render, never a
+# patch to remember.
+#
+# nodePort 30083 is a CONTRACT with aws_lb_target_group.signoz in iac/alb-signoz.tf. Pinned
+# rather than auto-assigned: a random port drifts from the target group on every recreate,
+# and the ALB then silently points at nothing.
+# ==============================================================================
+#
+#
+#
+apiVersion: v1
+kind: Service
+metadata:
+  name: signoz-nodeport
+  labels:
+    app.kubernetes.io/name: signoz
+    app.kubernetes.io/component: signoz-nodeport
+spec:
+  type: NodePort
+  # Selector copied EXACTLY from the chart v0.139.0 signoz Service. One wrong label and the
+  # Service matches no pods while the ALB reports unhealthy with no obvious cause.
+  selector:
+    app.kubernetes.io/component: signoz
+    app.kubernetes.io/instance: signoz
+    app.kubernetes.io/name: signoz
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30083

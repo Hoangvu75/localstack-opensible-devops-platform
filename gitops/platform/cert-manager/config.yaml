@@ -1,0 +1,8 @@
+# Here for exactly one reason: the OpenTelemetry Operator needs it to issue the admission
+# webhook certificate. Wave 5, before the Operator (15) — an Operator without that cert
+# CrashLoops, and agent injection then fails silently.
+name: cert-manager
+namespace: cert-manager
+manifestPath: gitops/platform/cert-manager
+syncWave: "5"
+prune: "true"

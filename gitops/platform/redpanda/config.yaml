@@ -1,0 +1,6 @@
+# Message queue speaking the Kafka wire protocol. Wave 12: ready before the first producer.
+name: redpanda
+namespace: redpanda
+manifestPath: gitops/platform/redpanda
+syncWave: "12"
+prune: "true"

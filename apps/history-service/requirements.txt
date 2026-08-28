@@ -1,0 +1,6 @@
+# Strictly pin every version — same rationale as memory-service: builds must be deterministic.
+#
+# NO opentelemetry packages here. The agent injected by the Operator carries both SDK and
+# instrumentation for aiokafka and aiohttp, so this image does not need OpenTelemetry dependencies.
+aiohttp==3.10.11
+aiokafka==0.11.0

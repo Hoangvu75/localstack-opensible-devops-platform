@@ -1,0 +1,180 @@
+---
+# Trigger app CI. This playbook simulates a webhook trigger — in production,
+# a GitHub push triggers CodePipeline/CodeBuild automatically.
+#
+# Boundaries: CI finishes upon pushing artifacts to ECR and committing image tags to GitOps.
+# ArgoCD detects GitOps commits and synchronizes the Kubernetes cluster asynchronously.
+- name: Build app image and hand off to GitOps
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    aws_endpoint: "{{ lookup('env', 'AWS_ENDPOINT') | default('http://localstack:4566', true) }}"
+    aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') | default('mock_access_key', true) }}"
+    aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') | default('mock_secret_key', true) }}"
+    aws_region: "{{ lookup('env', 'AWS_DEFAULT_REGION') | default('us-east-1', true) }}"
+    is_local: "{{ 'true' if 'localstack' in aws_endpoint or 'localhost' in aws_endpoint else 'false' }}"
+
+    github_repo: "github.com/Hoangvu75/learn-opensible.git"
+    git_branch: "main"
+
+    repo_dir: "/tmp/learn-opensible-build"
+    project_name: "learn-opensible"
+    # Source of truth for token. Matches local.github_token_secret_id in iac/secrets.tf.
+    secret_id_github: "{{ project_name }}/github-token"
+    cicd_bucket: "{{ project_name }}-cicd-artifacts"
+    codebuild_project: "{{ project_name }}-build"
+
+  tasks:
+    - name: Ensure CLI tooling is present
+      ansible.builtin.shell: |
+        set -e
+        if ! command -v aws >/dev/null 2>&1; then
+          curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+          unzip -q -o /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install --update
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+          echo installed-aws
+        fi
+        if [ ! -x /usr/local/bin/kubectl ]; then
+          curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.28.2/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+          echo installed-kubectl
+        fi
+        aws --version
+        /usr/local/bin/kubectl version --client=true 2>/dev/null | head -1 || true
+      register: tooling
+      changed_when: "'installed' in tooling.stdout"
+
+    # ── Retrieve git credential from AWS Secrets Manager ─────────────────────────
+    - name: Read the GitHub token from Secrets Manager
+      ansible.builtin.shell: |
+        if [ "{{ is_local }}" = "true" ]; then EP="--endpoint-url {{ aws_endpoint }}"; else EP=""; fi
+        aws secretsmanager get-secret-value --secret-id {{ secret_id_github }} \
+          --region {{ aws_region }} $EP --query SecretString --output text
+      register: gh_secret
+      no_log: true
+      changed_when: false
+      failed_when: false
+
+    - name: Fail early when the token secret is missing
+      ansible.builtin.fail:
+        msg: >-
+          Could not read secret "{{ secret_id_github }}" from Secrets Manager.
+          Populate it first using playbooks/1.manage-secrets.yml.
+          Token requires WRITE permission to allow CodeBuild to update image tags in gitops/workloads/.
+      when: gh_secret.rc != 0 or (gh_secret.stdout | default('') | trim | length) == 0
+
+    - name: Bind the token for this run
+      ansible.builtin.set_fact:
+        github_token: "{{ gh_secret.stdout | trim }}"
+      no_log: true
+
+    - name: Ensure fresh working directory
+      ansible.builtin.file:
+        path: "{{ repo_dir }}"
+        state: absent
+
+    - name: Clone source code from GitHub
+      ansible.builtin.git:
+        repo: "https://{{ github_token }}@{{ github_repo }}"
+        dest: "{{ repo_dir }}"
+        version: "{{ git_branch }}"
+        force: true
+      no_log: true
+
+    - name: Resolve the commit being built
+      ansible.builtin.shell: git rev-parse --short=7 HEAD
+      args:
+        chdir: "{{ repo_dir }}"
+      register: source_commit
+      changed_when: false
+
+    - name: Check whether this commit was already built
+      ansible.builtin.shell: |
+        if [ "{{ is_local }}" = "true" ]; then EP="--endpoint-url {{ aws_endpoint }}"; else EP=""; fi
+        aws ecr describe-images --repository-name {{ project_name }}-web-app \
+          --image-ids imageTag={{ source_commit.stdout | trim }} \
+          --region {{ aws_region }} $EP >/dev/null 2>&1 && echo "exists" || echo "missing"
+      register: image_check
+      changed_when: false
+      failed_when: false
+
+    - name: Decide whether a build is needed
+      ansible.builtin.set_fact:
+        build_needed: "{{ force_build | default(false) | bool or 'missing' in image_check.stdout }}"
+
+    - name: Report build decision
+      ansible.builtin.debug:
+        msg:
+          - "=========================================================="
+          - "commit           : {{ source_commit.stdout | trim }}"
+          - "app image in ECR : {{ 'exists' if 'exists' in image_check.stdout else 'missing' }}"
+          - "{{ '→ BUILD' if build_needed | bool else '→ SKIP (use -e force_build=true to force rebuild)' }}"
+          - "=========================================================="
+
+    - name: Archive the committed tree for CodeBuild
+      ansible.builtin.shell: git archive --format=zip -o source.zip HEAD
+      args:
+        chdir: "{{ repo_dir }}"
+      when: build_needed | bool
+
+    - name: Upload source code to S3 CI/CD Bucket
+      ansible.builtin.shell: |
+        if [ "{{ is_local }}" = "true" ]; then EP="--endpoint-url {{ aws_endpoint }}"; else EP=""; fi
+        aws s3 cp source.zip s3://{{ cicd_bucket }}/source.zip $EP
+      args:
+        chdir: "{{ repo_dir }}"
+      when: build_needed | bool
+
+    - name: Trigger AWS CodeBuild Project
+      ansible.builtin.shell: |
+        set -e
+        if [ "{{ is_local }}" = "true" ]; then
+          aws codebuild start-build --project-name {{ codebuild_project }} \
+            --environment-variables-override \
+              name=AWS_ENDPOINT_URL,value={{ aws_endpoint }},type=PLAINTEXT \
+              name=AWS_ACCESS_KEY_ID,value={{ aws_access_key }},type=PLAINTEXT \
+              name=AWS_SECRET_ACCESS_KEY,value={{ aws_secret_key }},type=PLAINTEXT \
+              name=AWS_DEFAULT_REGION,value={{ aws_region }},type=PLAINTEXT \
+              name=SOURCE_COMMIT,value={{ source_commit.stdout | trim }},type=PLAINTEXT \
+              name=GIT_REPO,value={{ github_repo }},type=PLAINTEXT \
+              name=GIT_BRANCH,value={{ git_branch }},type=PLAINTEXT \
+              name=GIT_TOKEN_SECRET_ID,value={{ secret_id_github }},type=PLAINTEXT \
+            --endpoint-url {{ aws_endpoint }} --query 'build.id' --output text
+        else
+          aws codebuild start-build --project-name {{ codebuild_project }} \
+            --environment-variables-override \
+              name=SOURCE_COMMIT,value={{ source_commit.stdout | trim }},type=PLAINTEXT \
+              name=GIT_REPO,value={{ github_repo }},type=PLAINTEXT \
+              name=GIT_BRANCH,value={{ git_branch }},type=PLAINTEXT \
+              name=GIT_TOKEN_SECRET_ID,value={{ secret_id_github }},type=PLAINTEXT \
+            --query 'build.id' --output text
+        fi
+      register: codebuild_start
+      when: build_needed | bool
+
+    - name: Extract the short build id
+      ansible.builtin.set_fact:
+        build_short_id: "{{ (codebuild_start.stdout | trim).split(':') | last }}"
+      when: build_needed | bool
+
+    - name: Hand-off notice
+      ansible.builtin.debug:
+        msg:
+          - "=========================================================="
+          - "Triggered build {{ build_short_id }} for commit {{ source_commit.stdout | trim }}."
+          - "Playbook complete — downstream tasks proceed asynchronously."
+          - ""
+          - "CodeBuild : build image → push ECR :{{ source_commit.stdout | trim }}"
+          - "            → kustomize edit set image → commit + push gitops/workloads/"
+          - "ArgoCD    : detect new commit → sync cluster"
+          - ""
+          - "Monitor build logs:"
+          - "{{ '  docker logs -f localstack-codebuild-' ~ build_short_id if is_local == 'true' else '  aws logs tail /aws/codebuild/' ~ codebuild_project ~ ' --follow' }}"
+          - "{{ '  (container starts in ~1-2 min in LocalStack)' if is_local == 'true' else '  or open CodeBuild console → build ' ~ build_short_id }}"
+          - ""
+          - "Check ArgoCD sync status:"
+          - "  kubectl -n argocd get application web -w"
+          - "=========================================================="
+      when: build_needed | bool

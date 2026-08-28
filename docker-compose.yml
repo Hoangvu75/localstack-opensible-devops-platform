@@ -1,0 +1,105 @@
+services:
+  opensible-console:
+    image: ossopensible/opensible-console:latest
+    container_name: opensible-console
+    restart: unless-stopped
+    ports:
+      - "5000:80"
+      - "8080:80"
+    environment:
+      - BACKEND_HOST=opensible-server
+      - BACKEND_PORT=5000
+    depends_on:
+      - opensible-server
+
+  opensible-server:
+    image: ossopensible/opensible-server:latest
+    container_name: opensible-server
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    environment:
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT:-http://localstack:4566}
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=mock_access_key
+      - AWS_SECRET_ACCESS_KEY=mock_secret_key
+    env_file:
+      - .env
+    volumes:
+      - ./data/opensible:/app/data
+
+  opensible-worker:
+    image: ossopensible/opensible-worker:latest
+    container_name: opensible-worker
+    restart: unless-stopped
+    environment:
+      - WORKER_SERVER_URL=http://opensible-server:5000
+      - WORKER_REGISTRATION_SECRET=opensible_worker_reg_secret_learning_lab_2026_32chars
+      - INTERNAL_CALL_SECRET=opensible_internal_call_secret_key_learning_lab_2026_32chars
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT:-http://localstack:4566}
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=mock_access_key
+      - AWS_SECRET_ACCESS_KEY=mock_secret_key
+      # This line is REQUIRED for .env to reach where playbooks run: this service does
+      # not declare `env_file`, so variables in .env are not automatically injected like
+      # in opensible-server.
+      #
+      # Used only for SECRET INGESTION: playbooks/1.manage-secrets.yml reads this variable
+      # to push the token to AWS Secrets Manager. Other playbooks and CodeBuild do NOT read
+      # .env — they retrieve the token from Secrets Manager via their AWS credentials.
+      #
+      # `:-` defaults to an empty string when unset, allowing the container to start.
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    volumes:
+      - ./data/opensible:/app/data
+      - //var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - opensible-server
+
+  localstack:
+    image: localstack/localstack-pro:latest
+    container_name: localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"
+      - "4510-4559:4510-4559"  # external services port range
+    environment:
+      - DEBUG=1
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_PAT:-}
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # Retain emulated resources across restarts, saved to ./data/localstack volume.
+      #
+      # Previously disabled for clean-slate resets during initial setup. Enabled because
+      # TLS certificates served by LocalStack for *.localhost.localstack.cloud expire after ~90 days,
+      # causing ImagePullBackOff on ECR images until restarted. Without PERSISTENCE, recreating
+      # takes ~20 minutes. See README §6.
+      #
+      # Trade-off: `tofu destroy` is no longer a complete wipe. Stale state survives restarts;
+      # deleting `data/localstack` is a key troubleshooting step when experiencing unexplained state issues.
+      - PERSISTENCE=1
+      # LocalStack's CSRF mitigation rejects any request carrying an Origin/Referer outside
+      # its allowlist with a 403. A browser sends no Referer for the top-level document but
+      # does for every subresource, so the page loads while all of /_next/static/* and
+      # favicon.ico are blocked — the app renders unstyled and never hydrates. This check is
+      # a LocalStack safeguard with no AWS counterpart, so turning it off changes nothing
+      # about the emulated services. Local lab only; never on anything reachable off-box.
+      - DISABLE_CORS_CHECKS=1
+      # LocalStack acts as the DNS server for containers it creates (including EKS k3d nodes)
+      # and resolves AWS-style domains to itself. However, registry.k8s.io redirects blob images
+      # to real CloudFront CDNs (cloudfront.net) — LocalStack intercepts those domains with its own cert,
+      # causing containerd certificate validation failures:
+      #   x509: certificate is valid for *.localhost.localstack.cloud, not d39mqg4b1dx9z1.cloudfront.net
+      # Result: external images fail with ImagePullBackOff (e.g. ingress-nginx).
+      #
+      # The patterns below force those external domains to resolve via real upstream DNS.
+      # They DO NOT intercept emulated CloudFront (*.cloudfront.localhost.localstack.cloud) or ECR.
+      #
+      # List covers registries needed by the cluster: ingress-nginx (registry.k8s.io),
+      # ArgoCD (quay.io + ghcr.io + docker.io), and their underlying CDN blob endpoints.
+      - DNS_NAME_PATTERNS_TO_RESOLVE_UPSTREAM=.*cloudfront\.net,.*\.pkg\.dev,.*registry\.k8s\.io,.*quay\.io,.*ghcr\.io,.*docker\.io,.*docker\.com,.*githubusercontent\.com,.*github\.com,.*\.azureedge\.net,.*blob\.core\.windows\.net
+    env_file:
+      - .env
+    volumes:
+      - ./data/localstack:/var/lib/localstack
+      - //var/run/docker.sock:/var/run/docker.sock
+

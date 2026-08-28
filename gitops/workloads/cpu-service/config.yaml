@@ -1,0 +1,6 @@
+# Node CPU metrics (TypeScript). Has its own ServiceAccount and ClusterRole.
+name: cpu-service
+namespace: devops-apps
+manifestPath: gitops/workloads/cpu-service
+syncWave: "35"
+prune: "true"

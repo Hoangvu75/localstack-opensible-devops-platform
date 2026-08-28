@@ -1,0 +1,109 @@
+---
+- name: Destroy S3 Stack via OpenTofu
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # Read from environment variables, fallback to local LocalStack defaults
+    aws_endpoint: "{{ lookup('env', 'AWS_ENDPOINT') | default('http://localstack:4566', true) }}"
+    aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') | default('mock_access_key', true) }}"
+    aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') | default('mock_secret_key', true) }}"
+    is_local: "{{ 'true' if 'localstack' in aws_endpoint or 'localhost' in aws_endpoint else 'false' }}"
+    github_repo: "github.com/Hoangvu75/learn-opensible.git"
+    aws_region: "{{ lookup('env', 'AWS_DEFAULT_REGION') | default('us-east-1', true) }}"
+
+    # Must match the backend block in iac/providers.tf and vars of 2.deploy-cloud-infra.yml
+    project_name: "learn-opensible"
+
+    # GitHub token retrieved from AWS Secrets Manager (populated by playbooks/1.manage-secrets.yml).
+    secret_id_github: "{{ project_name }}/github-token"
+    state_bucket: "{{ project_name }}-tfstate"
+    state_lock_table: "{{ project_name }}-tfstate-lock"
+    iac_dir: "/tmp/learn-opensible/iac"
+
+  tasks:
+    # opensible-worker container is ephemeral: ensure required CLI tools are present.
+    - name: Ensure CLI tooling is present
+      ansible.builtin.shell: |
+        set -e
+        if ! command -v aws >/dev/null 2>&1; then
+          curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+          unzip -q -o /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install --update
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+          echo installed-aws
+        fi
+        if [ ! -x /usr/local/bin/kubectl ]; then
+          curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.28.2/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+          echo installed-kubectl
+        fi
+        aws --version
+        /usr/local/bin/kubectl version --client=true 2>/dev/null | head -1 || true
+      register: tooling
+      changed_when: "'installed' in tooling.stdout"
+
+    # ── Retrieve git credential from AWS Secrets Manager ─────────────────────────
+    - name: Read the GitHub token from Secrets Manager
+      ansible.builtin.shell: |
+        if [ "{{ is_local }}" = "true" ]; then EP="--endpoint-url {{ aws_endpoint }}"; else EP=""; fi
+        aws secretsmanager get-secret-value --secret-id {{ secret_id_github }} \
+          --region {{ aws_region }} $EP --query SecretString --output text
+      register: gh_secret
+      no_log: true
+      changed_when: false
+      failed_when: false
+
+    - name: Fail early when the token secret is missing
+      ansible.builtin.fail:
+        msg: >-
+          Could not read secret "{{ secret_id_github }}" from Secrets Manager.
+          Populate it first using playbooks/1.manage-secrets.yml.
+      when: gh_secret.rc != 0 or (gh_secret.stdout | default('') | trim | length) == 0
+
+    - name: Bind the token for this run
+      ansible.builtin.set_fact:
+        github_token: "{{ gh_secret.stdout | trim }}"
+      no_log: true
+
+    - name: Clean working directory
+      ansible.builtin.file:
+        path: "/tmp/learn-opensible"
+        state: absent
+
+    - name: Clone source code from GitHub
+      ansible.builtin.git:
+        repo: "https://{{ github_token }}@{{ github_repo }}"
+        dest: "/tmp/learn-opensible"
+        version: "main"
+        force: true
+      no_log: true
+
+    - name: Construct Tofu Init Backend Configs
+      ansible.builtin.set_fact:
+        backend_args: >-
+          -backend-config="access_key={{ aws_access_key }}"
+          -backend-config="secret_key={{ aws_secret_key }}"
+          -backend-config="dynamodb_table={{ state_lock_table }}"
+          {% if is_local == "true" %}
+          -backend-config="endpoint={{ aws_endpoint }}"
+          -backend-config="use_path_style=true"
+          -backend-config="skip_credentials_validation=true"
+          -backend-config="skip_metadata_api_check=true"
+          -backend-config="skip_requesting_account_id=true"
+          {% endif %}
+
+    - name: Run OpenTofu Init
+      ansible.builtin.shell: tofu init -reconfigure -input=false {{ backend_args }}
+      args:
+        chdir: "{{ iac_dir }}"
+
+    - name: Run OpenTofu Destroy
+      ansible.builtin.shell: tofu destroy -auto-approve -input=false -var="aws_endpoint={{ aws_endpoint if is_local == 'true' else '' }}" -var="is_local={{ is_local }}"
+      args:
+        chdir: "{{ iac_dir }}"
+      register: destroy_result
+
+    - name: Show Destroy Output
+      ansible.builtin.debug:
+        var: destroy_result.stdout_lines

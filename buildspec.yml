@@ -1,0 +1,199 @@
+version: 0.2
+
+# ==============================================================================
+# CI — build only. NO deploy.
+# ==============================================================================
+# This is the CI/CD boundary. Earlier versions of this file built and ran `kubectl apply`,
+# requiring CI to hold cluster credentials with no clean way to promote images across environments.
+# Responsibilities are now cleanly separated:
+#
+#   1. Build images, push to ECR with tag = commit SHA
+#   2. Update gitops/workloads/<service>/kustomization.yaml with the tag and push to git
+#
+# ArgoCD runs INSIDE the cluster, detects new commits, and reconciles automatically.
+# CI never interacts with cluster credentials directly.
+#
+# ------------------------------------------------------------------------------
+# LocalStack notes (applies equally to real AWS):
+#  - Project-level `environment_variable` is NOT injected, and the build container lacks AWS
+#    credentials. Variables are passed by playbooks/4.build-app.yml via
+#    `start-build --environment-variables-override` — EXCEPT secrets.
+#    Secrets are retrieved directly from Secrets Manager using the build's IAM role,
+#    ensuring tokens never appear in CLI arguments. See post_build.
+#  - Each entry under `commands:` runs in its own shell; multi-step phases use `|` blocks
+#    and cross-phase state is written to /tmp/build_vars.env.
+#  - This file is inlined into the CodeBuild project by iac/codebuild.tf because the CodeBuild
+#    agent stack-overflows when resolving path-based buildspecs on LocalStack.
+#    => Modifying this file requires re-running playbooks/2.deploy-cloud-infra.yml.
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# Monorepo: a single build produces SIX images, all tagged with commit SHA.
+#
+# Using the same tag across services provides a single version identifier.
+# Checking running cluster state requires inspecting one string; rollback is a `git revert`.
+# Trade-off: changing one service rebuilds all — acceptable at this scale and prevents
+# mismatched service version matrices.
+# ------------------------------------------------------------------------------
+
+env:
+  variables:
+    # Directory under apps/ <-> ECR repository name <-> image name in workload overlay.
+    # When adding a new service, add it here, add the ECR repo in iac/ecr.tf, and update
+    # workload kustomization.yaml accordingly.
+    SERVICE_DIRS: "web:web-app cpu-service:cpu-service memory-service:memory-service disk-service:disk-service rest-service:rest-service history-service:history-service"
+
+phases:
+  pre_build:
+    commands:
+      - |
+        set -e
+        echo "=== Detecting environment ==="
+
+        PROJECT_NAME="learn-opensible"
+        AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+        if [ -n "$AWS_ENDPOINT_URL" ]; then
+          echo ">>> Running on LocalStack ($AWS_ENDPOINT_URL)"
+          IS_LOCAL="true"
+          AWS_ARGS="--endpoint-url $AWS_ENDPOINT_URL"
+        else
+          echo ">>> Running on real AWS"
+          IS_LOCAL="false"
+          AWS_ARGS=""
+        fi
+
+        # Query ECR directly rather than guessing host:port — LocalStack allocates dynamic ports 4510-4559,
+        # and "localhost" inside the container refers to itself rather than LocalStack host.
+        # Derive registry host from the first repo; all repos in the account share the same host.
+        REGISTRY_HOST=$(aws ecr describe-repositories \
+          --repository-names "${PROJECT_NAME}-web-app" \
+          --region "$AWS_DEFAULT_REGION" $AWS_ARGS \
+          --query 'repositories[0].repositoryUri' --output text)
+        REGISTRY_HOST="${REGISTRY_HOST%/*}"
+        echo ">>> REGISTRY_HOST=$REGISTRY_HOST"
+
+        # LocalStack ECR accepts anonymous pushes; real ECR requires authentication.
+        if [ "$IS_LOCAL" != "true" ]; then
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY_HOST"
+        fi
+
+        # Image tag = commit hash.
+        COMMIT_HASH=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c 1-7)
+        BUILD_SUFFIX="build-${CODEBUILD_BUILD_ID##*:}"
+        IMAGE_TAG="${SOURCE_COMMIT:-${COMMIT_HASH:-$BUILD_SUFFIX}}"
+        echo ">>> IMAGE_TAG=$IMAGE_TAG"
+
+        {
+          echo "IS_LOCAL='$IS_LOCAL'"
+          echo "AWS_ARGS='$AWS_ARGS'"
+          echo "AWS_DEFAULT_REGION='$AWS_DEFAULT_REGION'"
+          echo "PROJECT_NAME='$PROJECT_NAME'"
+          echo "REGISTRY_HOST='$REGISTRY_HOST'"
+          echo "IMAGE_TAG='$IMAGE_TAG'"
+        } > /tmp/build_vars.env
+        cat /tmp/build_vars.env
+        echo "=== pre_build done ==="
+
+  build:
+    commands:
+      - |
+        set -e
+        . /tmp/build_vars.env
+        echo "Build started on $(date)"
+
+        for pair in $SERVICE_DIRS; do
+          DIR="${pair%%:*}"
+          REPO="${PROJECT_NAME}-${pair##*:}"
+          URI="${REGISTRY_HOST}/${REPO}"
+
+          echo "──────────────────────────────────────────────"
+          echo ">>> build apps/${DIR} → ${URI}:${IMAGE_TAG}"
+
+          # Fail fast: if any service fails, the entire build fails.
+          docker build -t "${URI}:${IMAGE_TAG}" "apps/${DIR}"
+          docker tag "${URI}:${IMAGE_TAG}" "${URI}:latest"
+        done
+
+        echo "Build complete — $(echo $SERVICE_DIRS | wc -w) images"
+
+  post_build:
+    commands:
+      - |
+        set -e
+        . /tmp/build_vars.env
+        cd "$CODEBUILD_SRC_DIR"
+
+        echo "=== Pushing images to ECR ==="
+        for pair in $SERVICE_DIRS; do
+          REPO="${PROJECT_NAME}-${pair##*:}"
+          URI="${REGISTRY_HOST}/${REPO}"
+          docker push "${URI}:${IMAGE_TAG}"
+          docker push "${URI}:latest"
+        done
+
+        # ── Handover to GitOps ───────────────────────────────────────────────────
+        # CodeBuild source is a zip archive from S3, NOT a git clone — it lacks remotes and history.
+        # Clone a fresh copy to commit changes.
+        echo "=== Writing the image tags back to git ==="
+        if [ -z "$GIT_REPO" ]; then
+          echo "!!! Missing GIT_REPO — cannot update git, ArgoCD will not detect new images"
+          exit 1
+        fi
+
+        # Token is NOT passed via environment variables. The build retrieves it directly using
+        # its IAM role scoped to the project prefix (see iac/secrets.tf and iac/codebuild.tf).
+        # This prevents token exposure in worker `ps` outputs and CodeBuild build records.
+        SECRET_ID="${GIT_TOKEN_SECRET_ID:-learn-opensible/github-token}"
+        echo ">>> Fetching git credentials from Secrets Manager: $SECRET_ID"
+        GIT_TOKEN=$(aws secretsmanager get-secret-value \
+          --secret-id "$SECRET_ID" \
+          --region "$AWS_DEFAULT_REGION" $AWS_ARGS \
+          --query SecretString --output text 2>/dev/null || true)
+
+        if [ -z "$GIT_TOKEN" ] || [ "$GIT_TOKEN" = "None" ]; then
+          echo "!!! Could not retrieve secret \"$SECRET_ID\" from Secrets Manager."
+          echo "!!! Seed the secret with playbooks/1.manage-secrets.yml and verify CodeBuild"
+          echo "!!! service role permissions for secretsmanager:GetSecretValue."
+          exit 1
+        fi
+
+        # Install kustomize if not present in the CodeBuild image.
+        if ! command -v kustomize >/dev/null 2>&1; then
+          curl -sSfL https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh \
+            | bash -s 5.4.3 /usr/local/bin
+        fi
+
+        rm -rf /tmp/gitops && git clone --depth 1 --branch "${GIT_BRANCH:-main}" \
+          "https://${GIT_TOKEN}@${GIT_REPO}" /tmp/gitops
+
+        # Each service has a dedicated kustomization.yaml under gitops/workloads/<dir>/.
+        # Isolating files per service prevents merge conflicts and race conditions.
+        for pair in $SERVICE_DIRS; do
+          DIR="${pair%%:*}"
+          NAME="${PROJECT_NAME}-${pair##*:}"
+          TARGET="/tmp/gitops/gitops/workloads/${DIR}"
+          if [ ! -f "${TARGET}/kustomization.yaml" ]; then
+            echo ">>> SKIPPING ${DIR}: ${TARGET}/kustomization.yaml not found"
+            continue
+          fi
+          ( cd "${TARGET}" && kustomize edit set image "${NAME}=${REGISTRY_HOST}/${NAME}:${IMAGE_TAG}" )
+        done
+
+        cd /tmp/gitops
+        if git diff --quiet; then
+          echo ">>> kustomization.yaml already matches current image tags, no commit required"
+        else
+          git config user.email "codebuild@learn-opensible.local"
+          git config user.name  "AWS CodeBuild"
+          git add gitops/workloads/*/kustomization.yaml
+          # [skip ci] prevents recursive build trigger loops on webhook events.
+          git commit -m "chore(deploy): image tag ${IMAGE_TAG} [skip ci]"
+          git push origin "${GIT_BRANCH:-main}"
+          echo ">>> Pushed update. ArgoCD will detect the commit and synchronize."
+        fi
+
+        git --no-pager log -1 --oneline
+        echo "=== CI complete — deployment managed by ArgoCD ==="

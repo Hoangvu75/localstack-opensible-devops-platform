@@ -1,0 +1,64 @@
+# Instrumentation — the single place OpenTelemetry is configured for every service.
+#
+# The Operator watches pod annotations. On `inject-java: "true"` it adds an init container that
+# copies the agent into a shared emptyDir, mounts it, and sets JAVA_TOOL_OPTIONS plus the OTEL_*
+# variables below. The application knows nothing, the image carries no agent, and no Dockerfile
+# mentions OpenTelemetry. Changing the Collector endpoint is this file plus a pod restart.
+#
+# Go is deliberately absent: the Operator's `inject-go` uses eBPF and needs a privileged
+# container, CAP_SYS_PTRACE and shareProcessNamespace — in exchange for an HTTP server span that
+# `otelhttp` already provides in three unprivileged lines. See README §9.7.
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: devops-apps
+spec:
+  exporter:
+    # Applications only know the Collector. Swapping SigNoz for Tempo or Jaeger is a change to
+    # the Collector's ConfigMap, not to anything here.
+    endpoint: http://otel-collector.observability.svc.cluster.local:4318
+
+  propagators:
+    - tracecontext
+    - baggage
+
+  sampler:
+    type: parentbased_always_on
+
+  env:
+    # The endpoint above is HTTP on 4318. Java and Python autoconfigure default to gRPC on 4317,
+    # so without this they speak gRPC/HTTP2 to an HTTP/1.1 endpoint and die with
+    # FRAME_SIZE_ERROR — a message that gives no hint of the cause. Lost traces to exactly this.
+    - name: OTEL_EXPORTER_OTLP_PROTOCOL
+      value: http/protobuf
+
+    # These SDKs enable metrics and logs by default. This repo only uses traces; leaving them on
+    # sends two unrequested streams and floods the logs with export errors.
+    - name: OTEL_METRICS_EXPORTER
+      value: none
+    - name: OTEL_LOGS_EXPORTER
+      value: none
+
+    # BatchSpanProcessor defaults to 5000ms. Add the Collector's batch and the backend's ingest
+    # and a trace takes 5-15s to become COMPLETE — during which it looks exactly like a service
+    # that never answered. Seen for real: 5 spans at first, all 13 a few minutes later.
+    #
+    # 1000ms does not remove eventual consistency, it shortens the confusing window to ~2s.
+    # Return to 5000 on a high-traffic system.
+    - name: OTEL_BSP_SCHEDULE_DELAY
+      value: "1000"
+
+  java: {}
+  python: {}
+
+  nodejs:
+    env:
+      # The Collector's filter/health rule only drops the http SERVER span for /health and
+      # /ready. The express spans BELOW it survive and become orphans, which the backend
+      # re-parents to the root — a flat, structurally wrong tree. Measured on this cluster:
+      # ~2900 junk spans an hour. Disabling express instrumentation fixes both; the http SERVER
+      # span for /api/metrics is untouched, and these services have no middleware worth seeing.
+      #
+      # fs is off because it emits thousands of spans per file read.
+      - name: OTEL_NODE_DISABLED_INSTRUMENTATIONS
+        value: "express,fs"
